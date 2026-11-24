@@ -11938,6 +11938,11 @@ local function RemoveHoverObjects(root)
         root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart"))
     end
     if root then
+        pcall(function()
+            root.Anchored = false
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
         if HoverBV and HoverBV.Parent == root then pcall(function() HoverBV:Destroy() end) HoverBV = nil end
         if HoverBG and HoverBG.Parent == root then pcall(function() HoverBG:Destroy() end) HoverBG = nil end
         for _, obj in ipairs(root:GetChildren()) do
@@ -12012,7 +12017,7 @@ local function FindBossMonsterModel(bossDef)
     return taggedMob
 end
 
--- Teleport to boss safely on the GROUND (Supports both streamed mob & unstreamed coordinate fallback with StreamingEnabled Anti-Void)
+-- Teleport to boss safely on the GROUND (No mid-air floating; natural ground snap)
 local LastTeleportTime = 0
 local function TeleportToBoss(bossDef, targetMob)
     pcall(function()
@@ -12030,88 +12035,37 @@ local function TeleportToBoss(bossDef, targetMob)
         end
         if not root or not hum or hum.Health <= 0 then return end
 
-        -- 1. Determine destination coordinates
-        local targetPos = nil
-        local lookTarget = nil
+        -- Always purge hover/floating objects before and after teleporting
+        RemoveHoverObjects(root)
 
-        if targetMob and targetMob:GetPivot() then
-            local tPos = targetMob:GetPivot().Position
-            local tLook = targetMob:GetPivot().LookVector
-            targetPos = Vector3.new(tPos.X - (tLook.X * 3.5), tPos.Y, tPos.Z - (tLook.Z * 3.5))
-            lookTarget = Vector3.new(tPos.X, targetPos.Y, tPos.Z)
-        elseif bossDef and bossDef.pos then
-            targetPos = bossDef.pos
-        elseif bossDef and bossDef.zone and TeleportCoords[bossDef.zone] then
-            targetPos = TeleportCoords[bossDef.zone]
-        end
-
-        if not targetPos then return end
-
-        -- 2. Request engine chunk streaming around target arena
-        pcall(function()
-            if LocalPlayer.RequestStreamAroundAsync then
-                LocalPlayer:RequestStreamAroundAsync(targetPos, 2)
-            elseif workspace.RequestStreamAroundAsync then
-                workspace:RequestStreamAroundAsync(targetPos)
-            end
-        end)
-
-        -- 3. Pre-freeze character physics to prevent void falling while chunk loads
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-            root.Anchored = true
-        end)
-
-        -- 4. Initial CFrame placement
-        if lookTarget then
-            root.CFrame = CFrame.lookAt(targetPos, lookTarget)
-        else
-            root.CFrame = CFrame.new(targetPos.X, targetPos.Y + 3.0, targetPos.Z)
-        end
-
-        -- 5. Fire server WarpTo remote to synchronize zone
+        -- 1. Fire server remote to switch / load destination zone
         if bossDef and bossDef.zone then
             pcall(function()
                 Remotes.WarpTo:FireServer(bossDef.zone)
             end)
         end
 
-        -- 6. Raycast detection to find true ground collision surface as chunk streams
-        task.spawn(function()
-            local finalGroundY = nil
-            for _ = 1, 12 do
-                local rayParams = RaycastParams.new()
-                rayParams.FilterType = RaycastFilterType.Exclude
-                local char = LocalPlayer.Character
-                if char then rayParams.FilterDescendantsInstances = { char } end
-                local rayHit = workspace:Raycast(targetPos + Vector3.new(0, 15, 0), Vector3.new(0, -60, 0), rayParams)
-                if rayHit then
-                    finalGroundY = rayHit.Position.Y + 3.1
-                    break
-                end
-                task.wait(0.08)
-            end
+        -- 2. If target monster model is present, position player behind boss at ground level
+        if targetMob and targetMob:GetPivot() then
+            local tPos = targetMob:GetPivot().Position
+            local tLook = targetMob:GetPivot().LookVector
+            local behindPos = Vector3.new(tPos.X - (tLook.X * 3.5), tPos.Y, tPos.Z - (tLook.Z * 3.5))
+            local groundY = GetGroundY(behindPos)
+            root.CFrame = CFrame.lookAt(Vector3.new(behindPos.X, groundY, behindPos.Z), Vector3.new(tPos.X, groundY, tPos.Z))
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
 
-            -- Snap to verified solid ground surface and unanchor
-            pcall(function()
-                local r, h = GetChar()
-                if r and h and h.Health > 0 then
-                    local safeY = finalGroundY or (targetPos.Y + 2.5)
-                    if lookTarget then
-                        r.CFrame = CFrame.lookAt(Vector3.new(targetPos.X, safeY, targetPos.Z), Vector3.new(lookTarget.X, safeY, lookTarget.Z))
-                    else
-                        r.CFrame = CFrame.new(targetPos.X, safeY, targetPos.Z)
-                    end
-                    r.AssemblyLinearVelocity = Vector3.zero
-                    r.AssemblyAngularVelocity = Vector3.zero
-                    r.Anchored = false
-                    RemoveHoverObjects(r)
-                end
-            end)
+        -- 3. Post-teleport ground check: make sure character is unanchored and firmly grounded
+        task.delay(0.1, function()
+            local r = GetChar()
+            if r then
+                RemoveHoverObjects(r)
+            end
         end)
     end)
 end
+
 
 local function GetUsableSkills()
     local active = {}
@@ -12181,19 +12135,15 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 
--- Anti-Floating Watchdog: Automatically purge stuck BodyVelocity if not actively attacking
+-- Anti-Floating Watchdog: Automatically purge stuck BodyVelocity and ensure grounded
 task.spawn(function()
     while true do
         if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
-        task.wait(0.5)
+        task.wait(0.3)
         if not State.CurrentTarget or not State.ActiveBossTarget then
             local root = GetChar()
             if root then
-                for _, obj in ipairs(root:GetChildren()) do
-                    if obj:IsA("BodyVelocity") or obj:IsA("BodyGyro") or obj.Name:find("Hover") or obj.Name:find("StreetHub") then
-                        pcall(function() obj:Destroy() end)
-                    end
-                end
+                RemoveHoverObjects(root)
             end
         end
     end
@@ -12220,17 +12170,21 @@ task.spawn(function()
                         State.CurrentTarget = mob
                         TeleportToBoss(bDef, mob)
                     else
-                        -- If mob hasn't streamed in yet or boss is waiting to spawn, keep character safely at boss arena
+                        -- Boss model not yet streamed or spawning: verify player is in the correct arena zone
                         local targetPos = bDef.pos or (bDef.zone and TeleportCoords[bDef.zone])
                         if targetPos then
                             local dist = (root.Position - targetPos).Magnitude
-                            if dist > 60 then
-                                TeleportToBoss(bDef, nil)
+                            if dist > 120 then
+                                -- Far away (e.g. in Town or after respawn): warp to boss zone via server remote
+                                if bDef.zone then
+                                    Remotes.WarpTo:FireServer(bDef.zone)
+                                end
+                                RemoveHoverObjects(root)
                             end
                         end
                     end
                 else
-                    -- Target is active: check distance to boss; if character was displaced or pushed away (> 50 studs), re-teleport!
+                    -- Target is active: check distance to boss; if character was displaced (> 50 studs), re-teleport
                     local tPos = curTarget:GetPivot().Position
                     local dist = (root.Position - tPos).Magnitude
                     if dist > 50 then
@@ -12252,6 +12206,7 @@ pcall(function()
         end
     end)
 end)
+
 
 -- Combat Execution Thread (SetTarget, Skills & Dodge)
 local LastTargetSent = nil
@@ -12316,6 +12271,7 @@ task.spawn(function()
                     State.CurrentTarget = nil
                     LastTargetSent = nil
                     local root = GetChar()
+                    RemoveHoverObjects(root)
                 end
             end
         end
@@ -12341,28 +12297,18 @@ task.spawn(function()
 
             if isLive and liveBossDef then
                 if liveReason == "spawning_soon" and remainingTime and remainingTime > 0 then
-                    -- Spawning soon: STAY IN SERVER & WARP TO BOSS ARENA!
-                    HadLiveBossInServer = true
-                    State.ActiveBossTarget = liveBossDef
-
+                    -- Spawning soon: STAY IN SERVER!
                     local notifyKey = (liveBossDef.alias or liveBossDef.name) .. "_" .. tostring(math.floor(remainingTime / 15))
                     if LastNotifiedSoonKey ~= notifyKey then
                         LastNotifiedSoonKey = notifyKey
                         local bName = liveBossDef.alias or liveBossDef.name
                         Fluent:Notify({
                             Title = "Street Hub · บอสกำลังจะเกิด!",
-                            Content = string.format("⏳ บอส %s กำลังจะเกิดใน %d วินาที! วาร์ปไปรอหน้าห้องบอส...", bName, math.ceil(remainingTime)),
+                            Content = string.format("⏳ บอส %s กำลังจะเกิดใน %d วินาที! พักการ Hop เพื่อรอในเซิร์ฟนี้...", bName, math.ceil(remainingTime)),
                             Duration = 5
                         })
                         -- Dispatch Discord Webhook: Boss Spawning Soon
                         SendWebhookBossSpawningSoon(liveBossDef, remainingTime)
-                    end
-
-                    -- Warp to boss arena immediately to wait (prevents standing idle in town)
-                    local root = GetChar()
-                    local tPos = liveBossDef.pos or (liveBossDef.zone and TeleportCoords[liveBossDef.zone])
-                    if root and tPos and (root.Position - tPos).Magnitude > 60 then
-                        TeleportToBoss(liveBossDef, nil)
                     end
                 else
                     -- BOSS IS LIVE!
@@ -12387,19 +12333,20 @@ task.spawn(function()
                         -- Dispatch Discord Webhook: Boss Found!
                         SendWebhookBossFound(liveBossDef, remainingTime)
 
-                        -- Find target monster model & warp immediately (with retry for streaming)
+                        -- Find target monster model & warp
                         task.spawn(function()
-                            -- 1. Instant warp attempt to boss position/zone to trigger streaming
-                            TeleportToBoss(liveBossDef, nil)
-                            task.wait(0.6)
-
-                            -- 2. Scan for streamed monster model
-                            local foundMob = FindBossMonsterModel(liveBossDef)
-                            if not foundMob then
-                                for _ = 1, 6 do
-                                    task.wait(0.4)
-                                    foundMob = FindBossMonsterModel(liveBossDef)
-                                    if foundMob then break end
+                            task.wait(0.3)
+                            local mf = workspace:FindFirstChild("Monsters")
+                            local foundMob = nil
+                            if mf then
+                                for _, mob in ipairs(mf:GetChildren()) do
+                                    local mId = (mob:GetAttribute("MonsterId") or mob.Name or ""):lower()
+                                    local dName = (mob:GetAttribute("DisplayName") or mob.Name or ""):lower()
+                                    if (liveBossDef.id and (mId == liveBossDef.id:lower() or mId:find(liveBossDef.id:lower(), 1, true))) or
+                                       (liveBossDef.alias and (dName == liveBossDef.alias:lower() or dName:find(liveBossDef.alias:lower(), 1, true))) then
+                                        foundMob = mob
+                                        break
+                                    end
                                 end
                             end
 
@@ -12408,13 +12355,6 @@ task.spawn(function()
                                 TeleportToBoss(liveBossDef, foundMob)
                             end
                         end)
-                    else
-                        -- Re-ensure position if displaced or waiting
-                        local root = GetChar()
-                        local tPos = liveBossDef.pos or (liveBossDef.zone and TeleportCoords[liveBossDef.zone])
-                        if root and tPos and (root.Position - tPos).Magnitude > 60 then
-                            TeleportToBoss(liveBossDef, State.CurrentTarget)
-                        end
                     end
                 end
             elseif liveReason ~= "no_selection" and liveReason ~= "invalid" then
@@ -12691,67 +12631,40 @@ task.spawn(function()
 end)
 
 
-
 -- ==================== STREET HUB EMBEDDED LOGO ASSET LOADER ==================== --
-local STREET_HUB_LOGO_B64 = "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"
+local STREET_HUB_LOGO_B64 = "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"
 
 local function DecodeBase64(data)
     local b = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     data = string.gsub(data, "[^" .. b .. "=]", "")
-    local bytes = {}
-    local len = #data
-    for i = 1, len, 4 do
-        local c1 = string.find(b, string.sub(data, i, i), 1, true) - 1
-        local c2 = string.find(b, string.sub(data, i + 1, i + 1), 1, true) - 1
-        local ch3 = string.sub(data, i + 2, i + 2)
-        local ch4 = string.sub(data, i + 3, i + 3)
-        local c3 = (ch3 ~= "=") and (string.find(b, ch3, 1, true) - 1) or 0
-        local c4 = (ch4 ~= "=") and (string.find(b, ch4, 1, true) - 1) or 0
-
-        local v1 = c1 or 0
-        local v2 = c2 or 0
-        local v3 = c3 or 0
-        local v4 = c4 or 0
-
-        local n = bit32.bor(bit32.lshift(v1, 18), bit32.lshift(v2, 12), bit32.lshift(v3, 6), v4)
-        table.insert(bytes, string.char(bit32.band(bit32.rshift(n, 16), 0xFF)))
-        if ch3 ~= "=" then table.insert(bytes, string.char(bit32.band(bit32.rshift(n, 8), 0xFF))) end
-        if ch4 ~= "=" then table.insert(bytes, string.char(bit32.band(n, 0xFF))) end
-    end
-    return table.concat(bytes)
+    return (data:gsub(".", function(x)
+        if x == "=" then return "" end
+        local r, f = "", (b:find(x) - 1)
+        for i = 6, 1, -1 do r = r .. (f % 2^i - f % 2^(i - 1) > 0 and "1" or "0") end
+        return r
+    end):gsub("%d%d%d%d%d%d%d%d", function(x)
+        local c = 0
+        for i = 1, 8 do c = c + (x:sub(i, i) == "1" and 2^(8 - i) or 0) end
+        return string.char(c)
+    end))
 end
 
-local CachedStreetHubLogo = nil
+local StreetHubLogoAsset = nil
 local function GetStreetHubLogo()
-    if CachedStreetHubLogo and type(CachedStreetHubLogo) == "string" and CachedStreetHubLogo ~= "" then
-        return CachedStreetHubLogo
-    end
-
-    local fileName = "streethub_logo.png"
-    local getAsset = getcustomasset or getsynasset
-
+    if StreetHubLogoAsset then return StreetHubLogoAsset end
     pcall(function()
-        if not (isfile and isfile(fileName)) then
-            if writefile then
-                local rawBytes = DecodeBase64(STREET_HUB_LOGO_B64)
-                if rawBytes and #rawBytes > 50 then
-                    writefile(fileName, rawBytes)
-                end
+        if writefile and getcustomasset then
+            local fileName = "streethub_logo.png"
+            if not isfile or not isfile(fileName) then
+                local binary = DecodeBase64(STREET_HUB_LOGO_B64)
+                writefile(fileName, binary)
             end
+            StreetHubLogoAsset = getcustomasset(fileName)
         end
     end)
-
-    if getAsset and isfile and isfile(fileName) then
-        local asset = nil
-        pcall(function() asset = getAsset(fileName) end)
-        if asset and type(asset) == "string" and asset ~= "" and not string.find(asset, "rbxasset://%%x") then
-            CachedStreetHubLogo = asset
-            return asset
-        end
-    end
-
-    return "rbxassetid://10734975486"
+    return StreetHubLogoAsset or "rbxassetid://10734975486"
 end
+
 
 -- ==================== CREATE STREET HUB SHADCN WINDOW & TABS ==================== --
 local Camera = workspace.CurrentCamera
@@ -13202,6 +13115,7 @@ do
         end
     })
 end
+
 
 -- ==================== MOBILE DRAGGABLE FLOATING TOGGLE BUTTON ==================== --
 task.defer(function()
