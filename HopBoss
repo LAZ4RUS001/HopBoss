@@ -11675,6 +11675,13 @@ local function ServerHop(reasonText)
     end)
 end
 
+-- Teleport Failure Handler
+pcall(function()
+    TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+        State.IsHopping = false
+    end)
+end)
+
 -- ==================== BOSS DETECTION & SCANNING LOGIC ==================== --
 local function CheckBossHopTargetLive()
     local targetType = State.BossHopTarget or "Tempest Dragon King"
@@ -12005,55 +12012,104 @@ local function FindBossMonsterModel(bossDef)
     return taggedMob
 end
 
--- Teleport to boss safely on the GROUND (Supports both streamed mob & unstreamed coordinate fallback)
+-- Teleport to boss safely on the GROUND (Supports both streamed mob & unstreamed coordinate fallback with StreamingEnabled Anti-Void)
+local LastTeleportTime = 0
 local function TeleportToBoss(bossDef, targetMob)
     pcall(function()
-        local root = GetChar()
-        if not root then
+        local now = os.clock()
+        if (now - LastTeleportTime) < 0.6 then return end
+        LastTeleportTime = now
+
+        local root, hum = GetChar()
+        if not root or not hum or hum.Health <= 0 then
             for _ = 1, 15 do
                 task.wait(0.2)
-                root = GetChar()
-                if root then break end
+                root, hum = GetChar()
+                if root and hum and hum.Health > 0 then break end
             end
         end
-        if not root then return end
+        if not root or not hum or hum.Health <= 0 then return end
 
-        -- 1. Fire WarpTo server remote to unlock gate / register zone
+        -- 1. Determine destination coordinates
+        local targetPos = nil
+        local lookTarget = nil
+
+        if targetMob and targetMob:GetPivot() then
+            local tPos = targetMob:GetPivot().Position
+            local tLook = targetMob:GetPivot().LookVector
+            targetPos = Vector3.new(tPos.X - (tLook.X * 3.5), tPos.Y, tPos.Z - (tLook.Z * 3.5))
+            lookTarget = Vector3.new(tPos.X, targetPos.Y, tPos.Z)
+        elseif bossDef and bossDef.pos then
+            targetPos = bossDef.pos
+        elseif bossDef and bossDef.zone and TeleportCoords[bossDef.zone] then
+            targetPos = TeleportCoords[bossDef.zone]
+        end
+
+        if not targetPos then return end
+
+        -- 2. Request engine chunk streaming around target arena
+        pcall(function()
+            if LocalPlayer.RequestStreamAroundAsync then
+                LocalPlayer:RequestStreamAroundAsync(targetPos, 2)
+            elseif workspace.RequestStreamAroundAsync then
+                workspace:RequestStreamAroundAsync(targetPos)
+            end
+        end)
+
+        -- 3. Pre-freeze character physics to prevent void falling while chunk loads
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.Anchored = true
+        end)
+
+        -- 4. Initial CFrame placement
+        if lookTarget then
+            root.CFrame = CFrame.lookAt(targetPos, lookTarget)
+        else
+            root.CFrame = CFrame.new(targetPos.X, targetPos.Y + 3.0, targetPos.Z)
+        end
+
+        -- 5. Fire server WarpTo remote to synchronize zone
         if bossDef and bossDef.zone then
             pcall(function()
                 Remotes.WarpTo:FireServer(bossDef.zone)
             end)
         end
 
-        -- 2. Calculate accurate destination
-        local destCFrame = nil
-        if targetMob and targetMob:GetPivot() then
-            local tPos = targetMob:GetPivot().Position
-            local tLook = targetMob:GetPivot().LookVector
-            local behindPos = Vector3.new(tPos.X - (tLook.X * 3.5), tPos.Y, tPos.Z - (tLook.Z * 3.5))
-            local groundY = GetGroundY(behindPos)
-            destCFrame = CFrame.lookAt(Vector3.new(behindPos.X, groundY, behindPos.Z), Vector3.new(tPos.X, groundY, tPos.Z))
-        elseif bossDef and bossDef.pos then
-            -- Fallback when boss model is not yet streamed: teleport to known arena location
-            local bPos = bossDef.pos
-            local groundY = GetGroundY(bPos)
-            destCFrame = CFrame.new(bPos.X, groundY + 2.5, bPos.Z)
-        elseif bossDef and bossDef.zone and TeleportCoords[bossDef.zone] then
-            local zPos = TeleportCoords[bossDef.zone]
-            local groundY = GetGroundY(zPos)
-            destCFrame = CFrame.new(zPos.X, groundY + 2.5, zPos.Z)
-        end
+        -- 6. Raycast detection to find true ground collision surface as chunk streams
+        task.spawn(function()
+            local finalGroundY = nil
+            for _ = 1, 12 do
+                local rayParams = RaycastParams.new()
+                rayParams.FilterType = RaycastFilterType.Exclude
+                local char = LocalPlayer.Character
+                if char then rayParams.FilterDescendantsInstances = { char } end
+                local rayHit = workspace:Raycast(targetPos + Vector3.new(0, 15, 0), Vector3.new(0, -60, 0), rayParams)
+                if rayHit then
+                    finalGroundY = rayHit.Position.Y + 3.1
+                    break
+                end
+                task.wait(0.08)
+            end
 
-        if destCFrame then
+            -- Snap to verified solid ground surface and unanchor
             pcall(function()
-                root.AssemblyLinearVelocity = Vector3.zero
-                root.AssemblyAngularVelocity = Vector3.zero
+                local r, h = GetChar()
+                if r and h and h.Health > 0 then
+                    local safeY = finalGroundY or (targetPos.Y + 2.5)
+                    if lookTarget then
+                        r.CFrame = CFrame.lookAt(Vector3.new(targetPos.X, safeY, targetPos.Z), Vector3.new(lookTarget.X, safeY, lookTarget.Z))
+                    else
+                        r.CFrame = CFrame.new(targetPos.X, safeY, targetPos.Z)
+                    end
+                    r.AssemblyLinearVelocity = Vector3.zero
+                    r.AssemblyAngularVelocity = Vector3.zero
+                    r.Anchored = false
+                    RemoveHoverObjects(r)
+                end
             end)
-            root.CFrame = destCFrame
-        end
-
-        -- Always purge hover after teleport so character drops firmly to ground
-        RemoveHoverObjects(root)
+        end)
     end)
 end
 
@@ -12148,12 +12204,12 @@ end)
 task.spawn(function()
     while true do
         if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
-        task.wait(0.4)
+        task.wait(0.5)
 
-        if State.AutoBossHop and State.BossHopAutoAttackOnJoin and State.ActiveBossTarget then
+        if State.AutoBossHop and State.ActiveBossTarget then
             local bDef = State.ActiveBossTarget
-            local root = GetChar()
-            if root then
+            local root, hum = GetChar()
+            if root and hum and hum.Health > 0 then
                 local curTarget = State.CurrentTarget
                 local targetValid = curTarget and curTarget.Parent and (tonumber(curTarget:GetAttribute("HP")) or tonumber(curTarget:GetAttribute("Health")) or 0) > 0
 
@@ -12164,26 +12220,37 @@ task.spawn(function()
                         State.CurrentTarget = mob
                         TeleportToBoss(bDef, mob)
                     else
-                        -- If mob hasn't streamed in yet, check distance to known boss arena
+                        -- If mob hasn't streamed in yet or boss is waiting to spawn, keep character safely at boss arena
                         local targetPos = bDef.pos or (bDef.zone and TeleportCoords[bDef.zone])
                         if targetPos then
                             local dist = (root.Position - targetPos).Magnitude
-                            if dist > 80 then
+                            if dist > 60 then
                                 TeleportToBoss(bDef, nil)
                             end
                         end
                     end
                 else
-                    -- Target is active: check distance to boss; if character was displaced or pushed away (> 60 studs), re-teleport!
+                    -- Target is active: check distance to boss; if character was displaced or pushed away (> 50 studs), re-teleport!
                     local tPos = curTarget:GetPivot().Position
                     local dist = (root.Position - tPos).Magnitude
-                    if dist > 60 then
+                    if dist > 50 then
                         TeleportToBoss(bDef, curTarget)
                     end
                 end
             end
         end
     end
+end)
+
+-- Respawn Watchdog: Re-teleport to boss immediately if character respawns in Town after death
+pcall(function()
+    LocalPlayer.CharacterAdded:Connect(function()
+        task.wait(1.0)
+        if State.AutoBossHop and State.ActiveBossTarget then
+            local bDef = State.ActiveBossTarget
+            TeleportToBoss(bDef, State.CurrentTarget)
+        end
+    end)
 end)
 
 -- Combat Execution Thread (SetTarget, Skills & Dodge)
@@ -12194,61 +12261,6 @@ local SkillCooldowns = {}
 
 task.spawn(function()
     while true do
-        if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
-        task.wait(0.1)
-
-        if State.BossHopAutoAttackOnJoin and State.ActiveBossTarget then
-            local target = State.CurrentTarget
-            if target and target.Parent then
-                local hp = tonumber(target:GetAttribute("HP")) or tonumber(target:GetAttribute("Health")) or 0
-                if hp > 0 then
-                    local now = os.clock()
-                    if target ~= LastTargetSent or (now - LastTargetTime) > 1.2 then
-                        LastTargetSent = target
-                        LastTargetTime = now
-                        pcall(function()
-                            Remotes.SetTarget:FireServer(target, false, true)
-                        end)
-                    end
-
-                    -- Skill Rotation
-                    if State.AutoSkills then
-                        local skills = GetUsableSkills()
-                        if #skills > 0 then
-                            local sId = skills[CurrentSkillIndex]
-                            if sId then
-                                CurrentSkillIndex = (CurrentSkillIndex % #skills) + 1
-                                local lastUsed = SkillCooldowns[sId] or 0
-                                if (now - lastUsed) >= 0.35 then
-                                    SkillCooldowns[sId] = now
-                                    pcall(function()
-                                        Remotes.UseSkill:FireServer(sId, target)
-                                    end)
-                                end
-                            else
-                                CurrentSkillIndex = 1
-                            end
-                        end
-                    end
-
-                    -- Auto Dodge Roll (i-frame)
-                    if State.AutoDodge then
-                        pcall(function()
-                            local isAttacking = target:GetAttribute("IsAttacking") or target:GetAttribute("CastingSkill")
-                            if isAttacking then
-                                Remotes.Dash:FireServer()
-                            end
-                        end)
-                    end
-                else
-                    -- Target dead, loot immediately and drop to ground
-                    pcall(function()
-                        Remotes.PickupDrop:FireServer(true)
-                        Remotes.PickupDrop:FireServer()
-                    end)
-                    State.CurrentTarget = nil
-                    LastTargetSent = nil
-                    local root = GetChar()
                     RemoveHoverObjects(root)
                 end
             end
@@ -12275,18 +12287,28 @@ task.spawn(function()
 
             if isLive and liveBossDef then
                 if liveReason == "spawning_soon" and remainingTime and remainingTime > 0 then
-                    -- Spawning soon: STAY IN SERVER!
+                    -- Spawning soon: STAY IN SERVER & WARP TO BOSS ARENA!
+                    HadLiveBossInServer = true
+                    State.ActiveBossTarget = liveBossDef
+
                     local notifyKey = (liveBossDef.alias or liveBossDef.name) .. "_" .. tostring(math.floor(remainingTime / 15))
                     if LastNotifiedSoonKey ~= notifyKey then
                         LastNotifiedSoonKey = notifyKey
                         local bName = liveBossDef.alias or liveBossDef.name
                         Fluent:Notify({
                             Title = "Street Hub · บอสกำลังจะเกิด!",
-                            Content = string.format("⏳ บอส %s กำลังจะเกิดใน %d วินาที! พักการ Hop เพื่อรอในเซิร์ฟนี้...", bName, math.ceil(remainingTime)),
+                            Content = string.format("⏳ บอส %s กำลังจะเกิดใน %d วินาที! วาร์ปไปรอหน้าห้องบอส...", bName, math.ceil(remainingTime)),
                             Duration = 5
                         })
                         -- Dispatch Discord Webhook: Boss Spawning Soon
                         SendWebhookBossSpawningSoon(liveBossDef, remainingTime)
+                    end
+
+                    -- Warp to boss arena immediately to wait (prevents standing idle in town)
+                    local root = GetChar()
+                    local tPos = liveBossDef.pos or (liveBossDef.zone and TeleportCoords[liveBossDef.zone])
+                    if root and tPos and (root.Position - tPos).Magnitude > 60 then
+                        TeleportToBoss(liveBossDef, nil)
                     end
                 else
                     -- BOSS IS LIVE!
@@ -12332,6 +12354,13 @@ task.spawn(function()
                                 TeleportToBoss(liveBossDef, foundMob)
                             end
                         end)
+                    else
+                        -- Re-ensure position if displaced or waiting
+                        local root = GetChar()
+                        local tPos = liveBossDef.pos or (liveBossDef.zone and TeleportCoords[liveBossDef.zone])
+                        if root and tPos and (root.Position - tPos).Magnitude > 60 then
+                            TeleportToBoss(liveBossDef, State.CurrentTarget)
+                        end
                     end
                 end
             elseif liveReason ~= "no_selection" and liveReason ~= "invalid" then
