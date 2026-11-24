@@ -12261,7 +12261,61 @@ local SkillCooldowns = {}
 
 task.spawn(function()
     while true do
-                    RemoveHoverObjects(root)
+        if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
+        task.wait(0.1)
+
+        if State.BossHopAutoAttackOnJoin and State.ActiveBossTarget then
+            local target = State.CurrentTarget
+            if target and target.Parent then
+                local hp = tonumber(target:GetAttribute("HP")) or tonumber(target:GetAttribute("Health")) or 0
+                if hp > 0 then
+                    local now = os.clock()
+                    if target ~= LastTargetSent or (now - LastTargetTime) > 1.2 then
+                        LastTargetSent = target
+                        LastTargetTime = now
+                        pcall(function()
+                            Remotes.SetTarget:FireServer(target, false, true)
+                        end)
+                    end
+
+                    -- Skill Rotation
+                    if State.AutoSkills then
+                        local skills = GetUsableSkills()
+                        if #skills > 0 then
+                            local sId = skills[CurrentSkillIndex]
+                            if sId then
+                                CurrentSkillIndex = (CurrentSkillIndex % #skills) + 1
+                                local cd = SkillCooldowns[sId] or 0
+                                if (now - cd) >= 0.5 then
+                                    SkillCooldowns[sId] = now
+                                    pcall(function()
+                                        Remotes.UseSkill:FireServer(sId, target)
+                                    end)
+                                end
+                            else
+                                CurrentSkillIndex = 1
+                            end
+                        end
+                    end
+
+                    -- Auto Dodge
+                    if State.AutoDodge then
+                        pcall(function()
+                            local isAttacking = target:GetAttribute("IsAttacking") or target:GetAttribute("CastingSkill")
+                            if isAttacking then
+                                Remotes.Dash:FireServer()
+                            end
+                        end)
+                    end
+                else
+                    -- Target dead, loot immediately and drop to ground
+                    pcall(function()
+                        Remotes.PickupDrop:FireServer(true)
+                        Remotes.PickupDrop:FireServer()
+                    end)
+                    State.CurrentTarget = nil
+                    LastTargetSent = nil
+                    local root = GetChar()
                 end
             end
         end
