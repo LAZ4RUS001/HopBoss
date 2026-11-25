@@ -12079,19 +12079,38 @@ local function GetChar()
     return root, hum, char
 end
 
--- Raycast down to find exact ground surface Y level (Feet touch floor)
+-- Raycast down to find exact ground surface Y level (Feet touch floor, never float)
 local function GetGroundY(pos)
     local rayParams = RaycastParams.new()
     rayParams.FilterType = RaycastFilterType.Exclude
+    local filterList = {}
     local char = LocalPlayer.Character
-    if char then
-        rayParams.FilterDescendantsInstances = { char }
+    if char then table.insert(filterList, char) end
+    if State.CurrentTarget then table.insert(filterList, State.CurrentTarget) end
+    for _, f in ipairs({"Monsters", "Mobs", "Living", "Enemies", "NPCs", "Spawners", "BossEffects"}) do
+        local folder = workspace:FindFirstChild(f)
+        if folder then table.insert(filterList, folder) end
     end
-    local rayResult = workspace:Raycast(pos + Vector3.new(0, 10, 0), Vector3.new(0, -60, 0), rayParams)
-    if rayResult then
-        return rayResult.Position.Y + 3.1
+    rayParams.FilterDescendantsInstances = filterList
+
+    -- 1. Primary ray: cast down from 40 studs above pos down 240 studs
+    local originY = (typeof(pos.Y) == "number") and (pos.Y + 40) or 100
+    local rayResult = workspace:Raycast(Vector3.new(pos.X, originY, pos.Z), Vector3.new(0, -240, 0), rayParams)
+    if rayResult and rayResult.Position then
+        return rayResult.Position.Y + 2.85
     end
-    return pos.Y
+
+    -- 2. Secondary ray: cast directly down from current character RootPart position
+    local root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart"))
+    if root then
+        local rootDown = workspace:Raycast(root.Position + Vector3.new(0, 15, 0), Vector3.new(0, -100, 0), rayParams)
+        if rootDown and rootDown.Position then
+            return rootDown.Position.Y + 2.85
+        end
+        return root.Position.Y
+    end
+
+    return (typeof(pos.Y) == "number") and pos.Y or 0
 end
 
 -- Comprehensive Hover / Floating Objects Cleaner
@@ -12102,59 +12121,36 @@ local function RemoveHoverObjects(root)
         root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart"))
     end
     if root then
-        local hadHover = false
-        if HoverBV and HoverBV.Parent == root then
+        pcall(function()
+            if root.Anchored then
+                root.Anchored = false
+            end
+        end)
+        if HoverBV then
             pcall(function() HoverBV:Destroy() end)
             HoverBV = nil
-            hadHover = true
         end
-        if HoverBG and HoverBG.Parent == root then
+        if HoverBG then
             pcall(function() HoverBG:Destroy() end)
             HoverBG = nil
-            hadHover = true
         end
         for _, obj in ipairs(root:GetChildren()) do
-            if obj.Name:find("StreetHub") or obj.Name:find("Hover") or obj:IsA("BodyVelocity") or obj:IsA("BodyGyro") or obj:IsA("BodyPosition") or obj:IsA("AlignPosition") or obj:IsA("VectorForce") then
+            if obj:IsA("BodyVelocity") or obj:IsA("BodyGyro") or obj:IsA("BodyPosition") or obj:IsA("AlignPosition") or obj:IsA("VectorForce") or obj:IsA("BodyForce") or obj.Name:find("StreetHub") or obj.Name:find("Hover") then
                 pcall(function() obj:Destroy() end)
-                hadHover = true
             end
         end
         local char = root.Parent
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         if hum then
-            hum.PlatformStand = false
-            hum.Sit = false
-        end
-        if hadHover then
-            pcall(function()
-                root.Anchored = false
-                root.AssemblyLinearVelocity = Vector3.zero
-                root.AssemblyAngularVelocity = Vector3.zero
-            end)
+            if hum.PlatformStand then hum.PlatformStand = false end
+            if hum.Sit then hum.Sit = false end
         end
     end
 end
 
 local function EnsureHoverObjects(root)
-    if not root then return end
-    if not HoverBV or HoverBV.Parent ~= root then
-        if root:FindFirstChild("StreetHub_HoverBV") then root.StreetHub_HoverBV:Destroy() end
-        HoverBV = Instance.new("BodyVelocity")
-        HoverBV.Name = "StreetHub_HoverBV"
-        HoverBV.MaxForce = Vector3.new(1e5, 1e5, 1e5)
-        HoverBV.Velocity = Vector3.zero
-        HoverBV.Parent = root
-    end
-    if not HoverBG or HoverBG.Parent ~= root then
-        if root:FindFirstChild("StreetHub_HoverBG") then root.StreetHub_HoverBG:Destroy() end
-        HoverBG = Instance.new("BodyGyro")
-        HoverBG.Name = "StreetHub_HoverBG"
-        HoverBG.MaxTorque = Vector3.new(1e5, 1e5, 1e5)
-        HoverBG.P = 3000
-        HoverBG.D = 300
-        HoverBG.CFrame = root.CFrame
-        HoverBG.Parent = root
-    end
+    -- Deprecated: Purge hover objects permanently to prevent any floating
+    RemoveHoverObjects(root)
 end
 
 -- Search for physical monster model in workspace.Monsters and CollectionService
@@ -12292,40 +12288,29 @@ RunService.Heartbeat:Connect(function()
     local targetPos = target:GetPivot().Position
     local targetLook = target:GetPivot().LookVector
 
-    if State.GroundCombat ~= false then
-        -- ==================== GROUND COMBAT MODE (ยืนบนพื้น ไม่ลอยตัว) ==================== --
-        RemoveHoverObjects(root)
+    -- ==================== 100% GROUND COMBAT (ยืนบนพื้น ขาแตะพื้นตลอดเวลา ไม่ลอยตัว) ==================== --
+    RemoveHoverObjects(root)
 
-        -- Position behind boss at GROUND LEVEL
-        local behindPos = Vector3.new(targetPos.X - (targetLook.X * 3.5), targetPos.Y, targetPos.Z - (targetLook.Z * 3.5))
-        local groundY = GetGroundY(behindPos)
-        local groundBehind = Vector3.new(behindPos.X, groundY, behindPos.Z)
+    -- Position behind boss at TRUE GROUND LEVEL
+    local behindPos = Vector3.new(targetPos.X - (targetLook.X * 3.5), targetPos.Y, targetPos.Z - (targetLook.Z * 3.5))
+    local groundY = GetGroundY(behindPos)
+    local groundBehind = Vector3.new(behindPos.X, groundY, behindPos.Z)
 
-        root.CFrame = CFrame.lookAt(groundBehind, Vector3.new(targetPos.X, groundY, targetPos.Z))
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    else
-        -- Hover Mode (Only when GroundCombat is toggled off)
-        EnsureHoverObjects(root)
-        local strikePos = Vector3.new(targetPos.X - (targetLook.X * 3.5), targetPos.Y + 2.5, targetPos.Z - (targetLook.Z * 3.5))
-        root.CFrame = CFrame.lookAt(strikePos, targetPos)
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        if HoverBG then HoverBG.CFrame = root.CFrame end
-        if HoverBV then HoverBV.Velocity = Vector3.zero end
-    end
+    root.CFrame = CFrame.lookAt(groundBehind, Vector3.new(targetPos.X, groundY, targetPos.Z))
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
 end)
 
--- Anti-Floating Watchdog: Automatically purge stuck BodyVelocity and ensure grounded
+-- Anti-Floating Watchdog: Automatically purge stuck BodyVelocity, unanchor, and ensure grounded
 task.spawn(function()
     while true do
         if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
-        task.wait(0.3)
+        task.wait(0.2)
         if State.Teleporting or State.IsHopping then
-            task.wait(0.5)
+            task.wait(0.4)
         elseif not State.CurrentTarget or not State.ActiveBossTarget then
             local root = GetChar()
-            if root and (HoverBV or HoverBG or root:FindFirstChild("StreetHub_HoverBV") or root:FindFirstChild("StreetHub_HoverBG")) then
+            if root then
                 RemoveHoverObjects(root)
             end
         end
