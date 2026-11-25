@@ -20,6 +20,41 @@ local TeleportService = game:GetService("TeleportService")
 local Camera = workspace.CurrentCamera
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
 
+-- ==================== MULTI-LAYERED ANTI-AFK & DISCONNECT ENGINE ==================== --
+local function DisableCoreIdledConnections()
+    pcall(function()
+        if getconnections then
+            for _, conn in ipairs(getconnections(LocalPlayer.Idled)) do
+                pcall(function()
+                    if disableconnection then
+                        disableconnection(conn)
+                    elseif conn.Disable then
+                        conn:Disable()
+                    elseif conn.Disconnect then
+                        conn:Disconnect()
+                    elseif conn.Enabled ~= nil then
+                        conn.Enabled = false
+                    end
+                end)
+            end
+        end
+    end)
+end
+
+pcall(DisableCoreIdledConnections)
+pcall(function()
+    LocalPlayer.Idled:Connect(function()
+        DisableCoreIdledConnections()
+        pcall(function()
+            local vu = game:GetService("VirtualUser")
+            if vu then
+                vu:CaptureController()
+                vu:ClickButton2(Vector2.new(0, 0))
+            end
+        end)
+    end)
+end)
+
 -- Single Instance Guard
 local ScriptInstanceId = HttpService:GenerateGUID(false)
 _G.StreetHub_BossHopInstance = ScriptInstanceId
@@ -11599,19 +11634,26 @@ local function PrepareForTeleport()
         end
     end)
 
-    -- Auto-execute script in next server if executor supports queue_on_teleport
+    -- Auto-execute script in next server if executor supports queue_on_teleport (with 2.0s safe load delay)
     pcall(function()
         local queue = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
         if queue then
-            local scriptCode = nil
-            if readfile and isfile and isfile("Street Hub/HuntingTogether_BossHop.lua") then
-                scriptCode = 'loadstring(readfile("Street Hub/HuntingTogether_BossHop.lua"))()'
-            elseif readfile and isfile and isfile("HuntingTogether_BossHop.lua") then
-                scriptCode = 'loadstring(readfile("HuntingTogether_BossHop.lua"))()'
-            end
-            if scriptCode then
-                queue(scriptCode)
-            end
+            local scriptCode = [[
+                task.spawn(function()
+                    repeat task.wait(0.5) until game:IsLoaded() and game:GetService("Players").LocalPlayer
+                    task.wait(2.0)
+                    local rf = readfile or (syn and syn.readfile)
+                    local isf = isfile or (syn and syn.isfile)
+                    if rf and isf then
+                        if isf("Street Hub/HuntingTogether_BossHop.lua") then
+                            loadstring(rf("Street Hub/HuntingTogether_BossHop.lua"))()
+                        elseif isf("HuntingTogether_BossHop.lua") then
+                            loadstring(rf("HuntingTogether_BossHop.lua"))()
+                        end
+                    end
+                end)
+            ]]
+            queue(scriptCode)
         end
     end)
 end
@@ -11752,11 +11794,18 @@ local function ServerHop(reasonText)
 
             -- Stop all combat & background loops before teleport to prevent client crash
             PrepareForTeleport()
-            task.wait(0.6)
+            task.wait(1.2)
 
             local tpSuccess, tpErr = pcall(function()
                 TeleportService:TeleportToPlaceInstance(game.PlaceId, chosen.id, LocalPlayer)
             end)
+
+            if not tpSuccess then
+                -- Fallback to standard Teleport if PlaceInstance failed
+                pcall(function()
+                    TeleportService:Teleport(game.PlaceId, LocalPlayer)
+                end)
+            end
 
             if not tpSuccess then
                 warn("[Street Hub] TeleportToPlaceInstance call error:", tostring(tpErr))
@@ -11833,14 +11882,13 @@ pcall(function()
         local errorMsg = GuiService:GetErrorMessage()
         warn("[Street Hub] Detected Game Error / Disconnect Prompt: [" .. tostring(errorType) .. "] " .. tostring(errorMsg))
         if State.AutoBossHop then
-            pcall(function() GuiService:ClearError() end)
             if LastAttemptedJobId then
                 FailedJobIds[LastAttemptedJobId] = true
             end
             State.IsHopping = false
             State.Teleporting = false
-            task.delay(1.0, function()
-                ServerHop("หลุดจากการเชื่อมต่อ กำลังสุ่มเชื่อมต่อเซิร์ฟเวอร์ใหม่...")
+            pcall(function()
+                TeleportService:Teleport(game.PlaceId, LocalPlayer)
             end)
         end
     end)
