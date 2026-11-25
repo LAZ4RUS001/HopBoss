@@ -124,6 +124,7 @@ local State = {
     Teleporting = false, -- ป้องกันการ crash ระหว่าง teleport
     LastBossHopCheck = 0,
     NoBossCountdownActive = false, -- นับถอยหลัง 10 วินาทีเมื่อไม่เจอบอสเพื่อกันเกมเด้งหลุด
+    BossDefeatedCountdownActive = false, -- นับถอยหลัง 10 วินาทีหลังบอสตายเพื่อเก็บของและกันเกมเด้งหลุด
     ActiveBossTarget = nil,
     CurrentTarget = nil,
     AutoSkills = true,
@@ -11621,6 +11622,7 @@ local LastAttemptedJobId = nil
 local function PrepareForTeleport()
     State.Teleporting = true
     State.NoBossCountdownActive = false
+    State.BossDefeatedCountdownActive = false
     State.IsHopping = true
     State.ActiveBossTarget = nil
     State.CurrentTarget = nil
@@ -12635,32 +12637,55 @@ task.spawn(function()
 
                 if HadLiveBossInServer then
                     -- The boss in this server has been defeated!
-                    if BossKilledLootDelayUntil == 0 then
-                        BossKilledLootDelayUntil = os.clock() + 3.5
-                        Fluent:Notify({
-                            Title = "Street Hub · 💀 บอสถูกกำจัดแล้ว!",
-                            Content = "🎉 กำจัดบอสสำเร็จ! เก็บของ 3 วินาทีแล้วจะ Hop หาบอสเซิร์ฟเวอร์ต่อไป...",
-                            Duration = 4
-                        })
-                        -- Dispatch Discord Webhook: Boss Defeated!
-                        SendWebhookBossDefeated(liveBossDef or State.ActiveBossTarget)
-                    end
-
-                    if os.clock() >= BossKilledLootDelayUntil then
+                    if not State.BossDefeatedCountdownActive and not State.IsHopping and not State.Teleporting then
+                        State.BossDefeatedCountdownActive = true
                         HadLiveBossInServer = false
                         LastNotifiedLiveBoss = nil
-                        BossKilledLootDelayUntil = 0
                         State.ActiveBossTarget = nil
                         State.CurrentTarget = nil
                         RemoveHoverObjects(root)
-                        if State.AutoDismantle then
-                            pcall(function() DismantleGearNow(true) end)
-                        end
-                        local now = os.clock()
-                        if (now - (State.LastBossHopCheck or 0)) >= 4.0 then
-                            State.LastBossHopCheck = now
-                            ServerHop("💀 บอสเซิร์ฟนี้ตายแล้ว! กำลัง Hop ไปล่าบอสเซิร์ฟเวอร์ถัดไป...")
-                        end
+
+                        -- Dispatch Discord Webhook: Boss Defeated!
+                        SendWebhookBossDefeated(liveBossDef or State.ActiveBossTarget)
+
+                        task.spawn(function()
+                            for cd = 10, 1, -1 do
+                                if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
+                                if not State.AutoBossHop or State.IsHopping or State.Teleporting then
+                                    State.BossDefeatedCountdownActive = false
+                                    break
+                                end
+
+                                -- Auto Loot continuously during the 10-second buffer
+                                pcall(function()
+                                    Remotes.PickupDrop:FireServer(true)
+                                    Remotes.PickupDrop:FireServer()
+                                end)
+
+                                -- Realtime countdown notification (at 10s, 7s, 5s, 3s, 2s, 1s)
+                                if cd == 10 or cd == 7 or cd == 5 or cd <= 3 then
+                                    Fluent:Notify({
+                                        Title = "Street Hub · 💀 บอสถูกกำจัดแล้ว! (Cooldown 10 วิ)",
+                                        Content = string.format("🎉 กำจัดบอสสำเร็จ! เก็บของ & ย้ายเซิร์ฟเวอร์ในอีก %d วินาที (ป้องกันเกมหลุด)...", cd),
+                                        Duration = 1.2
+                                    })
+                                end
+
+                                if cd == 3 and State.AutoDismantle then
+                                    pcall(function() DismantleGearNow(true) end)
+                                end
+
+                                task.wait(1.0)
+                            end
+
+                            State.BossDefeatedCountdownActive = false
+                            if State.AutoBossHop and not State.IsHopping and not State.Teleporting then
+                                if State.AutoDismantle then
+                                    pcall(function() DismantleGearNow(true) end)
+                                end
+                                ServerHop("💀 กำจัดบอสสำเร็จ (คูลดาวน์ครบ 10 วิ) กำลัง Hop ไปล่าบอสเซิร์ฟเวอร์ถัดไป...")
+                            end
+                        end)
                     end
                 else
                     -- No boss live in this server: 10s cooldown countdown to prevent game crash / disconnect
