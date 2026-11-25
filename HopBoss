@@ -88,6 +88,7 @@ local State = {
     IsHopping = false,
     Teleporting = false, -- ป้องกันการ crash ระหว่าง teleport
     LastBossHopCheck = 0,
+    NoBossCountdownActive = false, -- นับถอยหลัง 10 วินาทีเมื่อไม่เจอบอสเพื่อกันเกมเด้งหลุด
     ActiveBossTarget = nil,
     CurrentTarget = nil,
     AutoSkills = true,
@@ -98,7 +99,7 @@ local State = {
 
     -- Movement & Speed
     WalkSpeedEnabled = true, -- วิ่งความเร็วปกติของเกม ไม่เดินช้า
-    WalkSpeed = 24,
+    WalkSpeed = 26,
 
     -- Auto Dismantle Gear Settings
     AutoDismantle = false,
@@ -8349,7 +8350,7 @@ do
                         ring = "e0443e",
                         glyph = "x",
                         press = function()
-                            o:Destroy("Close")
+                            o:SetVisible(false)
                         end,
                     },
                     {
@@ -9080,7 +9081,7 @@ do
                             Icon = "log-out",
                             Destructive = true,
                             Callback = function()
-                                self:Destroy("Close")
+                                self:SetVisible(false)
                             end,
                         } }, aN, aO), "top"
                     if self._collapsed then
@@ -10952,9 +10953,30 @@ end
 
 -- ==================== CLEAN OLD GUIS ==================== --
 pcall(function()
+    local targets = {"StreetHub_BossHop_FloatingToggle", "StreetHub_MobileToggle", "shadcn", "shadcn-toasts"}
     local safeGui = GetSafeGuiParent()
-    if safeGui:FindFirstChild("StreetHub_BossHop_FloatingToggle") then
-        safeGui.StreetHub_BossHop_FloatingToggle:Destroy()
+    if safeGui then
+        for _, name in ipairs(targets) do
+            local old = safeGui:FindFirstChild(name)
+            if old then pcall(function() old:Destroy() end) end
+        end
+    end
+    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if pGui and pGui ~= safeGui then
+        for _, name in ipairs(targets) do
+            local old = pGui:FindFirstChild(name)
+            if old then pcall(function() old:Destroy() end) end
+        end
+    end
+    local cGui = game:GetService("CoreGui")
+    if cGui and cGui ~= safeGui then
+        local rGui = cGui:FindFirstChild("RobloxGui")
+        if rGui then
+            for _, name in ipairs(targets) do
+                local old = rGui:FindFirstChild(name)
+                if old then pcall(function() old:Destroy() end) end
+            end
+        end
     end
 end)
 
@@ -11234,7 +11256,7 @@ local function SaveBossHopState(isActive)
 
             -- Movement & Speed Persistence
             WalkSpeedEnabled = (State.WalkSpeedEnabled ~= false),
-            WalkSpeed = State.WalkSpeed or 24,
+            WalkSpeed = State.WalkSpeed or 26,
 
             -- Dismantle Settings Persistence
             AutoDismantle = State.AutoDismantle,
@@ -11563,6 +11585,7 @@ local LastAttemptedJobId = nil
 -- Prepare client safely before teleport (prevents C++ engine 0xC0000005 crashes during socket shutdown)
 local function PrepareForTeleport()
     State.Teleporting = true
+    State.NoBossCountdownActive = false
     State.IsHopping = true
     State.ActiveBossTarget = nil
     State.CurrentTarget = nil
@@ -12079,16 +12102,21 @@ local function RemoveHoverObjects(root)
         root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChildWhichIsA("BasePart"))
     end
     if root then
-        pcall(function()
-            root.Anchored = false
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-        end)
-        if HoverBV and HoverBV.Parent == root then pcall(function() HoverBV:Destroy() end) HoverBV = nil end
-        if HoverBG and HoverBG.Parent == root then pcall(function() HoverBG:Destroy() end) HoverBG = nil end
+        local hadHover = false
+        if HoverBV and HoverBV.Parent == root then
+            pcall(function() HoverBV:Destroy() end)
+            HoverBV = nil
+            hadHover = true
+        end
+        if HoverBG and HoverBG.Parent == root then
+            pcall(function() HoverBG:Destroy() end)
+            HoverBG = nil
+            hadHover = true
+        end
         for _, obj in ipairs(root:GetChildren()) do
             if obj.Name:find("StreetHub") or obj.Name:find("Hover") or obj:IsA("BodyVelocity") or obj:IsA("BodyGyro") or obj:IsA("BodyPosition") or obj:IsA("AlignPosition") or obj:IsA("VectorForce") then
                 pcall(function() obj:Destroy() end)
+                hadHover = true
             end
         end
         local char = root.Parent
@@ -12096,6 +12124,13 @@ local function RemoveHoverObjects(root)
         if hum then
             hum.PlatformStand = false
             hum.Sit = false
+        end
+        if hadHover then
+            pcall(function()
+                root.Anchored = false
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+            end)
         end
     end
 end
@@ -12236,16 +12271,20 @@ RunService.Heartbeat:Connect(function()
     local root, hum = GetChar()
     if not root or not hum or hum.Health <= 0 then return end
 
-    -- Guard: If no active boss target or no current target or target has no HP -> PURGE HOVER IMMEDIATELY!
+    -- Guard: If no active boss target or no current target or target has no HP -> PURGE HOVER ONLY IF HOVERING!
     if not State.BossHopAutoAttackOnJoin or not State.ActiveBossTarget or not State.CurrentTarget or not State.CurrentTarget.Parent then
-        RemoveHoverObjects(root)
+        if HoverBV or HoverBG or (root and (root:FindFirstChild("StreetHub_HoverBV") or root:FindFirstChild("StreetHub_HoverBG"))) then
+            RemoveHoverObjects(root)
+        end
         return
     end
 
     local target = State.CurrentTarget
     local hp = tonumber(target:GetAttribute("HP")) or tonumber(target:GetAttribute("Health")) or 0
     if hp <= 0 then
-        RemoveHoverObjects(root)
+        if HoverBV or HoverBG or (root and (root:FindFirstChild("StreetHub_HoverBV") or root:FindFirstChild("StreetHub_HoverBG"))) then
+            RemoveHoverObjects(root)
+        end
         State.CurrentTarget = nil
         return
     end
@@ -12286,35 +12325,60 @@ task.spawn(function()
             task.wait(0.5)
         elseif not State.CurrentTarget or not State.ActiveBossTarget then
             local root = GetChar()
-            if root then
+            if root and (HoverBV or HoverBG or root:FindFirstChild("StreetHub_HoverBV") or root:FindFirstChild("StreetHub_HoverBG")) then
                 RemoveHoverObjects(root)
             end
         end
     end
 end)
 
--- Normal Run Enforcement Loop (วิ่งความเร็วปกติของเกม 24 studs/s ไม่เดินช้าและไม่เร็วเกินไป)
+-- ==================== NORMAL RUN & NATIVE SPRINT ENFORCEMENT ==================== --
+-- ล็อกการวิ่งปกติของเกม (Native Sprint) + Stamina เต็มตลอดเวลา ไม่ให้ตัวละครหมดแรงแล้วเดินช้า
 task.spawn(function()
     while true do
         if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
-        task.wait(0.3)
+        task.wait(0.1)
         if State.WalkSpeedEnabled and not State.Teleporting and not State.IsHopping then
+            -- 1. บังคับเปิดระบบ Sprint ปกติของเกม (LumiSprintLock & OptAutoRun)
+            if LocalPlayer:GetAttribute("LumiSprintLock") ~= true then
+                pcall(function() LocalPlayer:SetAttribute("LumiSprintLock", true) end)
+            end
+            if LocalPlayer:GetAttribute("OptAutoRun") ~= true then
+                pcall(function() LocalPlayer:SetAttribute("OptAutoRun", true) end)
+            end
+            -- 2. เติม Stamina ตลอดเวลา ป้องกันตัวละครหมดแรงเดินช้า (Stamina Empty)
+            if (tonumber(LocalPlayer:GetAttribute("LumiStamina")) or 0) < 60 then
+                pcall(function()
+                    LocalPlayer:SetAttribute("LumiStamina", 100)
+                    LocalPlayer:SetAttribute("LumiStaminaEmpty", false)
+                end)
+            end
+            -- 3. ล็อกความเร็ว WalkSpeed ตามค่าวิ่งปกติ (Default: 26 studs/s ไม่กวนตัวคูณ Sprint x1.4)
             local _, hum = GetChar()
-            if hum and hum.Health > 0 and hum.WalkSpeed ~= State.WalkSpeed then
-                hum.WalkSpeed = State.WalkSpeed
+            if hum and hum.Health > 0 then
+                local targetSpd = tonumber(State.WalkSpeed) or 26
+                if hum.WalkSpeed < targetSpd then
+                    hum.WalkSpeed = targetSpd
+                end
             end
         end
     end
 end)
 
--- Character Spawn Speed Initializer
+-- Character Spawn Speed & Sprint Initializer
 pcall(function()
     LocalPlayer.CharacterAdded:Connect(function(char)
-        task.wait(0.5)
+        task.wait(0.3)
         if State.WalkSpeedEnabled then
+            pcall(function()
+                LocalPlayer:SetAttribute("LumiSprintLock", true)
+                LocalPlayer:SetAttribute("OptAutoRun", true)
+                LocalPlayer:SetAttribute("LumiStamina", 100)
+                LocalPlayer:SetAttribute("LumiStaminaEmpty", false)
+            end)
             local hum = char:WaitForChild("Humanoid", 5)
             if hum then
-                hum.WalkSpeed = tonumber(State.WalkSpeed) or 24
+                hum.WalkSpeed = tonumber(State.WalkSpeed) or 26
             end
         end
     end)
@@ -12485,6 +12549,7 @@ task.spawn(function()
                     end
                 else
                     -- BOSS IS LIVE!
+                    State.NoBossCountdownActive = false
                     HadLiveBossInServer = true
                     BossKilledLootDelayUntil = 0
                     State.ActiveBossTarget = liveBossDef
@@ -12565,22 +12630,49 @@ task.spawn(function()
                         end
                     end
                 else
-                    -- No boss live in this server: wait 5s for world sync before hopping
-                    if timeSinceJoin < 5.0 then
-                        if not NotifiedScanStarting then
-                            NotifiedScanStarting = true
-                            Fluent:Notify({
-                                Title = "Street Hub · Boss Hop",
-                                Content = "🔍 กำลังสแกนบอสในเซิร์ฟเวอร์ (รอโหลดข้อมูล 5 วินาที)...",
-                                Duration = 3
-                            })
-                        end
-                    else
-                        local now = os.clock()
-                        if (now - (State.LastBossHopCheck or 0)) >= 6.0 then
-                            State.LastBossHopCheck = now
-                            ServerHop("❌ ไม่พบบอสเป้าหมายในเซิร์ฟเวอร์นี้ กำลังสุ่มย้ายเซิร์ฟเวอร์ใหม่...")
-                        end
+                    -- No boss live in this server: 10s cooldown countdown to prevent game crash / disconnect
+                    if not State.NoBossCountdownActive and not State.IsHopping and not State.Teleporting then
+                        State.NoBossCountdownActive = true
+                        task.spawn(function()
+                            for cd = 10, 1, -1 do
+                                if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
+                                if not State.AutoBossHop or State.IsHopping or State.Teleporting then
+                                    State.NoBossCountdownActive = false
+                                    break
+                                end
+
+                                -- Check if boss spawned or is about to spawn during countdown
+                                local isLiveNow, liveBossNow, reasonNow, remTime = CheckBossHopTargetLive()
+                                if isLiveNow and liveBossNow then
+                                    local bName = liveBossNow.alias or liveBossNow.name or "Target Boss"
+                                    Fluent:Notify({
+                                        Title = "Street Hub · 🎯 พบบอสแล้ว!",
+                                        Content = string.format("ตรวจพบบอส %s! ยกเลิกการ Hop ทันที กำลังเข้าโจมตี...", bName),
+                                        Duration = 4
+                                    })
+                                    State.NoBossCountdownActive = false
+                                    return
+                                end
+
+                                -- Countdown notification (at 10s, 7s, 5s, 3s, 2s, 1s)
+                                if cd == 10 or cd == 7 or cd == 5 or cd <= 3 then
+                                    Fluent:Notify({
+                                        Title = "Street Hub · ⏳ ไม่พบบอส (Cooldown 10 วิ)",
+                                        Content = string.format("❌ ไม่พบบอสในเซิร์ฟนี้! กำลังย้ายเซิร์ฟในอีก %d วินาที (ป้องกันเกมหลุด)...", cd),
+                                        Duration = 1.2
+                                    })
+                                end
+                                task.wait(1.0)
+                            end
+
+                            State.NoBossCountdownActive = false
+                            if State.AutoBossHop and not State.IsHopping and not State.Teleporting then
+                                local isLiveNow, liveBossNow = CheckBossHopTargetLive()
+                                if not isLiveNow then
+                                    ServerHop("❌ ไม่พบบอสเป้าหมาย (คูลดาวน์ครบ 10 วิ) กำลังสุ่มย้ายเซิร์ฟเวอร์ใหม่...")
+                                end
+                            end
+                        end)
                     end
                 end
             end
@@ -12856,7 +12948,7 @@ local Window = UI:CreateWindow({
     Icon = GetStreetHubLogo(),
     Theme = "Dark",
     Accent = "Red",
-    ToggleKey = Enum.KeyCode.RightControl,
+    ToggleKey = Enum.KeyCode.RightShift,
     GamepadToggleKey = Enum.KeyCode.ButtonSelect,
     Island = false,
     Size = UDim2.fromOffset(defaultWidth, defaultHeight)
@@ -12866,9 +12958,38 @@ Window.Root = Window._root
 Window.GUI = Window.Instance
 Fluent.GUI = Window.Instance
 
-function Window:Minimize()
-    self:SetVisible(not self._visible)
+local function ToggleStreetHubWindow()
+    if not Window then return end
+    pcall(function()
+        local nextVis = not Window._visible
+        Window:SetVisible(nextVis)
+        if Window._holder then
+            Window._holder.Visible = nextVis
+        end
+    end)
 end
+
+function Window:Minimize()
+    ToggleStreetHubWindow()
+end
+
+pcall(function()
+    getgenv().StreetHub_Toggle = ToggleStreetHubWindow
+    getgenv().StreetHub_BossHop_Toggle = ToggleStreetHubWindow
+    getgenv().StreetHub_Window = Window
+end)
+
+-- Universal Multi-Key UI Toggle Listener (RightShift, RightControl, LeftControl, Insert, F8)
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightShift
+    or input.KeyCode == Enum.KeyCode.RightControl
+    or input.KeyCode == Enum.KeyCode.LeftControl
+    or input.KeyCode == Enum.KeyCode.Insert
+    or input.KeyCode == Enum.KeyCode.F8 then
+        ToggleStreetHubWindow()
+    end
+end)
 
 local _rawSelectTab = Window.SelectTab
 function Window:SelectTab(tabOrIdx)
@@ -13246,7 +13367,7 @@ do
 
     local WalkSpeedToggle = Tabs.Settings:AddToggle("WalkSpeedToggle", {
         Title = "Auto Run (วิ่งความเร็วปกติของเกม)",
-        Description = "ล็อกให้ตัวละครวิ่งตลอดเวลาด้วยความเร็วปกติของเกม (WalkSpeed: 24) ไม่เดินช้า",
+        Description = "ล็อกให้ตัวละครวิ่งตลอดเวลาด้วยความเร็วปกติของเกม (WalkSpeed: 26) ไม่หมดแรง ไม่เดินช้า",
         Default = (State.WalkSpeedEnabled ~= false)
     })
     WalkSpeedToggle:OnChanged(function(v)
@@ -13254,16 +13375,22 @@ do
         SaveBossHopState(State.AutoBossHop)
         local _, hum = GetChar()
         if hum then
-            hum.WalkSpeed = v and (tonumber(State.WalkSpeed) or 24) or 16
+            hum.WalkSpeed = v and (tonumber(State.WalkSpeed) or 26) or 16
+        end
+        if not v then
+            pcall(function()
+                LocalPlayer:SetAttribute("LumiSprintLock", false)
+                LocalPlayer:SetAttribute("OptAutoRun", false)
+            end)
         end
     end)
 
     local WalkSpeedSlider = Tabs.Settings:AddSlider("WalkSpeedSlider", {
         Title = "Run Speed (ความเร็ววิ่ง)",
-        Description = "ระดับความเร็ว (ปกติเกมเดิน: 16, ปกติเกมวิ่ง: 24)",
-        Default = State.WalkSpeed or 24,
+        Description = "ระดับความเร็ว (ปกติเกมเดิน: 16, ปกติเกมวิ่ง: 26)",
+        Default = tonumber(State.WalkSpeed) or 26,
         Min = 16,
-        Max = 36,
+        Max = 60,
         Rounding = 0
     })
     WalkSpeedSlider:OnChanged(function(v)
@@ -13421,11 +13548,19 @@ task.defer(function()
         end)
 
         mainBtn.MouseButton1Click:Connect(function()
+            -- Punchy Click Animation Pop
             pcall(function()
-                if Window then
-                    Window:SetVisible(not Window._visible)
-                end
+                local popDown = TweenService:Create(mainBtn, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                    Size = UDim2.fromOffset(42, 42)
+                })
+                popDown:Play()
+                popDown.Completed:Connect(function()
+                    TweenService:Create(mainBtn, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                        Size = UDim2.fromOffset(50, 50)
+                    }):Play()
+                end)
             end)
+            ToggleStreetHubWindow()
         end)
     end)
 end)
