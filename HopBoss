@@ -78,33 +78,6 @@ local function UniversalHttpGet(url, maxRetries)
     return nil
 end
 
--- Anti-Kick Protection Hook
-pcall(function()
-    if type(hookmetamethod) == "function" and type(checkcaller) == "function" and type(newcclosure) == "function" and type(getnamecallmethod) == "function" then
-        local oldNamecall
-        oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-            local method = getnamecallmethod()
-            if (method == "Kick" or method == "kick") and self == LocalPlayer and not checkcaller() then
-                warn("[Street Hub] Blocked client kick attempt.")
-                return nil
-            end
-            return oldNamecall(self, ...)
-        end))
-    end
-end)
-
--- Anti-AFK
-pcall(function()
-    LocalPlayer.Idled:Connect(function()
-        local vu = game:GetService("VirtualUser")
-        if vu then
-            vu:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-            task.wait(0.2)
-            vu:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-        end
-    end)
-end)
-
 -- ==================== STATE CONFIGURATION ==================== --
 local State = {
     AutoBossHop = false,
@@ -113,6 +86,7 @@ local State = {
     BossHopWaitSpawnTime = 30,
     BossHopAutoAttackOnJoin = true,
     IsHopping = false,
+    Teleporting = false, -- ป้องกันการ crash ระหว่าง teleport
     LastBossHopCheck = 0,
     ActiveBossTarget = nil,
     CurrentTarget = nil,
@@ -121,6 +95,10 @@ local State = {
     AutoLoot = true,
     GroundCombat = true, -- ยืนตีบนพื้น ขาแตะพื้นตลอดเวลา ไม่ลอยกลางอากาศ
     FarmPosition = "Behind",
+
+    -- Movement & Speed
+    WalkSpeedEnabled = true, -- วิ่งความเร็วปกติของเกม ไม่เดินช้า
+    WalkSpeed = 24,
 
     -- Auto Dismantle Gear Settings
     AutoDismantle = false,
@@ -135,8 +113,28 @@ local State = {
     WebhookNotifyBossDefeated = true,
     WebhookNotifyBossSpawningSoon = true,
     WebhookNotifyDrops = true,
-    WebhookDropFilter = "Gear & Cards Only" -- "Gear & Cards Only", "Cards Only", "All Drops"
+    WebhookDropFilter = "Gear & Cards Only"
 }
+
+-- Anti-Kick Protection Hook (Safe during teleportation)
+pcall(function()
+    if type(hookmetamethod) == "function" and type(checkcaller) == "function" and type(newcclosure) == "function" and type(getnamecallmethod) == "function" then
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+            local method = getnamecallmethod()
+            if (method == "Kick" or method == "kick") and self == LocalPlayer and not checkcaller() then
+                if State and (State.IsHopping or State.Teleporting) then
+                    return oldNamecall(self, ...)
+                end
+                warn("[Street Hub] Blocked client kick attempt.")
+                return nil
+            end
+            return oldNamecall(self, ...)
+        end))
+    end
+end)
+
+
 
 -- Street Hub UI Library (Shadcn Architecture)
 local UI = (function()
@@ -11234,6 +11232,10 @@ local function SaveBossHopState(isActive)
             Visited = vList,
             Timestamp = os.time(),
 
+            -- Movement & Speed Persistence
+            WalkSpeedEnabled = (State.WalkSpeedEnabled ~= false),
+            WalkSpeed = State.WalkSpeed or 24,
+
             -- Dismantle Settings Persistence
             AutoDismantle = State.AutoDismantle,
             DismantleTier = State.DismantleTier or "Tier I - IV",
@@ -11270,6 +11272,8 @@ local function LoadBossHopState()
                 if data.WebhookNotifyDrops ~= nil then State.WebhookNotifyDrops = data.WebhookNotifyDrops end
                 if data.WebhookDropFilter ~= nil then State.WebhookDropFilter = data.WebhookDropFilter end
                 if data.GroundCombat ~= nil then State.GroundCombat = data.GroundCombat end
+                if data.WalkSpeedEnabled ~= nil then State.WalkSpeedEnabled = data.WalkSpeedEnabled end
+                if data.WalkSpeed ~= nil then State.WalkSpeed = data.WalkSpeed end
                 if data.AutoDismantle ~= nil then State.AutoDismantle = data.AutoDismantle end
                 if data.DismantleTier ~= nil then State.DismantleTier = data.DismantleTier end
                 if data.KeepSuperiorGear ~= nil then State.KeepSuperiorGear = data.KeepSuperiorGear end
@@ -11553,7 +11557,136 @@ pcall(function()
     end)
 end)
 
--- ==================== ROBUST SERVER HOP ENGINE ==================== --
+-- ==================== ROBUST & CRASH-PROOF SERVER HOP ENGINE ==================== --
+local LastAttemptedJobId = nil
+
+-- Prepare client safely before teleport (prevents C++ engine 0xC0000005 crashes during socket shutdown)
+local function PrepareForTeleport()
+    State.Teleporting = true
+    State.IsHopping = true
+    State.ActiveBossTarget = nil
+    State.CurrentTarget = nil
+
+    pcall(function()
+        local root = GetChar()
+        if root then
+            RemoveHoverObjects(root)
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+    end)
+
+    -- Auto-execute script in next server if executor supports queue_on_teleport
+    pcall(function()
+        local queue = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+        if queue then
+            local scriptCode = nil
+            if readfile and isfile and isfile("Street Hub/HuntingTogether_BossHop.lua") then
+                scriptCode = 'loadstring(readfile("Street Hub/HuntingTogether_BossHop.lua"))()'
+            elseif readfile and isfile and isfile("HuntingTogether_BossHop.lua") then
+                scriptCode = 'loadstring(readfile("HuntingTogether_BossHop.lua"))()'
+            end
+            if scriptCode then
+                queue(scriptCode)
+            end
+        end
+    end)
+end
+
+-- Robust Server Scanner with cursor pagination & safe slot filtering
+local function FetchCandidateServers(maxNeeded)
+    maxNeeded = maxNeeded or 12
+    local candidates = {}
+    local sortOrders = {"Asc", "Desc"}
+
+    for _, sortOrder in ipairs(sortOrders) do
+        local cursor = ""
+        for page = 1, 3 do
+            local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100", game.PlaceId, sortOrder)
+            if cursor and cursor ~= "" then
+                url = url .. "&cursor=" .. tostring(cursor)
+            end
+
+            local body = UniversalHttpGet(url, 2)
+            if body then
+                local ok, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+                if ok and decoded and decoded.data and #decoded.data > 0 then
+                    for _, s in ipairs(decoded.data) do
+                        if type(s) == "table" and s.id and s.id ~= game.JobId and not FailedJobIds[s.id] and not VisitedJobIds[s.id] then
+                            local playing = tonumber(s.playing) or 0
+                            local maxP = tonumber(s.maxPlayers) or 16
+                            -- Keep servers with at least 3 free slots so they will NEVER be full when arriving
+                            if playing >= 1 and playing <= (maxP - 3) then
+                                table.insert(candidates, s)
+                            end
+                        end
+                    end
+                    cursor = decoded.nextPageCursor
+                    if not cursor or cursor == "" then break end
+                else
+                    break
+                end
+            else
+                break
+            end
+
+            if #candidates >= maxNeeded then break end
+            task.wait(0.2)
+        end
+        if #candidates >= maxNeeded then break end
+    end
+
+    -- Fallback 1: relax slot requirements (at least 2 free slots)
+    if #candidates == 0 then
+        for _, sortOrder in ipairs(sortOrders) do
+            local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100", game.PlaceId, sortOrder)
+            local body = UniversalHttpGet(url, 1)
+            if body then
+                local ok, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+                if ok and decoded and decoded.data then
+                    for _, s in ipairs(decoded.data) do
+                        if type(s) == "table" and s.id and s.id ~= game.JobId and not FailedJobIds[s.id] and not VisitedJobIds[s.id] then
+                            local playing = tonumber(s.playing) or 0
+                            local maxP = tonumber(s.maxPlayers) or 16
+                            if playing >= 1 and playing <= (maxP - 2) then
+                                table.insert(candidates, s)
+                            end
+                        end
+                    end
+                end
+            end
+            if #candidates > 0 then break end
+        end
+    end
+
+    -- Fallback 2: reset visited list if all servers have been visited
+    if #candidates == 0 then
+        VisitedJobIds = {}
+        VisitedJobIds[game.JobId] = true
+        for _, sortOrder in ipairs(sortOrders) do
+            local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100", game.PlaceId, sortOrder)
+            local body = UniversalHttpGet(url, 1)
+            if body then
+                local ok, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+                if ok and decoded and decoded.data then
+                    for _, s in ipairs(decoded.data) do
+                        if type(s) == "table" and s.id and s.id ~= game.JobId and not FailedJobIds[s.id] then
+                            local playing = tonumber(s.playing) or 0
+                            local maxP = tonumber(s.maxPlayers) or 16
+                            if playing >= 1 and playing < maxP then
+                                table.insert(candidates, s)
+                            end
+                        end
+                    end
+                end
+            end
+            if #candidates > 0 then break end
+        end
+    end
+
+    return candidates
+end
+
 local function ServerHop(reasonText)
     if State.IsHopping then return end
     State.IsHopping = true
@@ -11567,87 +11700,20 @@ local function ServerHop(reasonText)
     end)
 
     task.spawn(function()
-        local endpoints = {
-            string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId),
-            string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100", game.PlaceId),
-        }
-
-        local candidates = {}
-        for _, url in ipairs(endpoints) do
-            local body = UniversalHttpGet(url, 2)
-            if body then
-                local ok, decoded = pcall(function() return HttpService:JSONDecode(body) end)
-                if ok and decoded and decoded.data and #decoded.data > 0 then
-                    for _, s in ipairs(decoded.data) do
-                        if type(s) == "table" and s.id and s.id ~= game.JobId and not FailedJobIds[s.id] and not VisitedJobIds[s.id] then
-                            local playing = tonumber(s.playing) or 0
-                            local maxP = tonumber(s.maxPlayers) or 16
-                            if playing >= 2 and playing <= (maxP - 2) then
-                                table.insert(candidates, s)
-                            end
-                        end
-                    end
-                end
-            end
-            if #candidates >= 8 then break end
-        end
-
-        -- Fallback 1: any server with free slot
-        if #candidates == 0 then
-            for _, url in ipairs(endpoints) do
-                local body = UniversalHttpGet(url, 1)
-                if body then
-                    local ok, decoded = pcall(function() return HttpService:JSONDecode(body) end)
-                    if ok and decoded and decoded.data then
-                        for _, s in ipairs(decoded.data) do
-                            if type(s) == "table" and s.id and s.id ~= game.JobId and not FailedJobIds[s.id] and not VisitedJobIds[s.id] then
-                                local playing = tonumber(s.playing) or 0
-                                local maxP = tonumber(s.maxPlayers) or 16
-                                if playing < maxP then
-                                    table.insert(candidates, s)
-                                end
-                            end
-                        end
-                    end
-                end
-                if #candidates > 0 then break end
-            end
-        end
-
-        -- Fallback 2: reset visited list if all visited
-        if #candidates == 0 then
-            VisitedJobIds = {}
-            VisitedJobIds[game.JobId] = true
-            for _, url in ipairs(endpoints) do
-                local body = UniversalHttpGet(url, 1)
-                if body then
-                    local ok, decoded = pcall(function() return HttpService:JSONDecode(body) end)
-                    if ok and decoded and decoded.data then
-                        for _, s in ipairs(decoded.data) do
-                            if type(s) == "table" and s.id and s.id ~= game.JobId and not FailedJobIds[s.id] then
-                                local playing = tonumber(s.playing) or 0
-                                local maxP = tonumber(s.maxPlayers) or 16
-                                if playing < maxP then
-                                    table.insert(candidates, s)
-                                end
-                            end
-                        end
-                    end
-                end
-                if #candidates > 0 then break end
-            end
-        end
+        local candidates = FetchCandidateServers(10)
 
         if #candidates > 0 then
+            -- Prefer medium populated servers (4-8 players) with plenty of room
             table.sort(candidates, function(a, b)
                 local pa = tonumber(a.playing) or 0
                 local pb = tonumber(b.playing) or 0
                 return math.abs(pa - 6) < math.abs(pb - 6)
             end)
 
-            local topCount = math.min(3, #candidates)
+            local topCount = math.min(4, #candidates)
             local chosen = candidates[math.random(1, topCount)]
 
+            LastAttemptedJobId = chosen.id
             VisitedJobIds[chosen.id] = true
             if State.AutoBossHop then
                 SaveBossHopState(true)
@@ -11660,25 +11726,100 @@ local function ServerHop(reasonText)
                     Duration = 3
                 })
             end)
-            task.wait(0.5)
 
-            TeleportService:TeleportToPlaceInstance(game.PlaceId, chosen.id, LocalPlayer)
-            task.wait(8.0)
-            State.IsHopping = false
+            -- Stop all combat & background loops before teleport to prevent client crash
+            PrepareForTeleport()
+            task.wait(0.6)
+
+            local tpSuccess, tpErr = pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, chosen.id, LocalPlayer)
+            end)
+
+            if not tpSuccess then
+                warn("[Street Hub] TeleportToPlaceInstance call error:", tostring(tpErr))
+                FailedJobIds[chosen.id] = true
+                State.IsHopping = false
+                State.Teleporting = false
+                task.delay(1.5, function()
+                    if State.AutoBossHop then
+                        ServerHop("เกิดข้อผิดพลาดในการย้าย กำลังลองเซิร์ฟเวอร์อื่น...")
+                    end
+                end)
+                return
+            end
+
+            -- Safety watchdog: if not teleported after 12 seconds, reset hopping state and retry
+            task.wait(12.0)
+            if State.IsHopping then
+                FailedJobIds[chosen.id] = true
+                State.IsHopping = false
+                State.Teleporting = false
+                if State.AutoBossHop then
+                    ServerHop("การย้ายเซิร์ฟเวอร์หมดเวลา (Timeout) กำลังลองเซิร์ฟเวอร์ใหม่...")
+                end
+            end
         else
-            -- Ultimate fallback
-            if State.AutoBossHop then SaveBossHopState(true) end
-            TeleportService:Teleport(game.PlaceId, LocalPlayer)
-            task.wait(8.0)
+            -- No server found from API; wait 4 seconds and re-scan
+            pcall(function()
+                Fluent:Notify({
+                    Title = "Street Hub · Boss Hop",
+                    Content = "กำลังรีเซ็ตรายการเซิร์ฟเวอร์และลองค้นหาใหม่อีกครั้ง...",
+                    Duration = 3
+                })
+            end)
+            task.wait(4.0)
             State.IsHopping = false
+            if State.AutoBossHop then
+                ServerHop("เริ่มค้นหาเซิร์ฟเวอร์ใหม่อีกครั้ง...")
+            end
         end
     end)
 end
 
--- Teleport Failure Handler
+-- Teleport Failure & Disconnect Protection Handler
 pcall(function()
     TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+        warn("[Street Hub] Teleport failed:", tostring(errorMessage), "Result:", tostring(teleportResult))
+        if LastAttemptedJobId then
+            FailedJobIds[LastAttemptedJobId] = true
+        end
         State.IsHopping = false
+        State.Teleporting = false
+
+        pcall(function()
+            Fluent:Notify({
+                Title = "Street Hub · Hop Failed",
+                Content = "เซิร์ฟเวอร์เต็มหรือไม่สามารถเชื่อมต่อได้ กำลังค้นหาเซิร์ฟเวอร์ใหม่...",
+                Duration = 4
+            })
+        end)
+
+        task.delay(1.5, function()
+            if State.AutoBossHop then
+                ServerHop("เซิร์ฟเวอร์เดิมเข้าไม่ได้ กำลังสุ่มหาเซิร์ฟเวอร์ใหม่...")
+            end
+        end)
+    end)
+end)
+
+-- Auto Dismiss Roblox Error / Disconnect Prompt & Auto-Reconnect (Prevents Game Kick)
+pcall(function()
+    local GuiService = game:GetService("GuiService")
+    GuiService.ErrorMessageChanged:Connect(function()
+        local errorType = GuiService:GetErrorCode()
+        local errorMsg = GuiService:GetErrorMessage()
+        warn("[Street Hub] Detected Game Error / Disconnect Prompt: [" .. tostring(errorType) .. "] " .. tostring(errorMsg))
+        if State.AutoBossHop then
+            pcall(function() GuiService:ClearError() end)
+            if LastAttemptedJobId then
+                FailedJobIds[LastAttemptedJobId] = true
+            end
+            State.IsHopping = false
+            State.Teleporting = false
+            task.delay(1.0, function()
+                ServerHop("หลุดจากการเชื่อมต่อ กำลังสุ่มเชื่อมต่อเซิร์ฟเวอร์ใหม่...")
+            end)
+        end
     end)
 end)
 
@@ -12090,6 +12231,7 @@ end
 -- Combat Heartbeat Loop (60 FPS Tracking & Positioning)
 RunService.Heartbeat:Connect(function()
     if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then return end
+    if State.Teleporting or State.IsHopping then return end
 
     local root, hum = GetChar()
     if not root or not hum or hum.Health <= 0 then return end
@@ -12140,7 +12282,9 @@ task.spawn(function()
     while true do
         if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
         task.wait(0.3)
-        if not State.CurrentTarget or not State.ActiveBossTarget then
+        if State.Teleporting or State.IsHopping then
+            task.wait(0.5)
+        elseif not State.CurrentTarget or not State.ActiveBossTarget then
             local root = GetChar()
             if root then
                 RemoveHoverObjects(root)
@@ -12149,14 +12293,42 @@ task.spawn(function()
     end
 end)
 
+-- Normal Run Enforcement Loop (วิ่งความเร็วปกติของเกม 24 studs/s ไม่เดินช้าและไม่เร็วเกินไป)
+task.spawn(function()
+    while true do
+        if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
+        task.wait(0.3)
+        if State.WalkSpeedEnabled and not State.Teleporting and not State.IsHopping then
+            local _, hum = GetChar()
+            if hum and hum.Health > 0 and hum.WalkSpeed ~= State.WalkSpeed then
+                hum.WalkSpeed = State.WalkSpeed
+            end
+        end
+    end
+end)
+
+-- Character Spawn Speed Initializer
+pcall(function()
+    LocalPlayer.CharacterAdded:Connect(function(char)
+        task.wait(0.5)
+        if State.WalkSpeedEnabled then
+            local hum = char:WaitForChild("Humanoid", 5)
+            if hum then
+                hum.WalkSpeed = tonumber(State.WalkSpeed) or 24
+            end
+        end
+    end)
+end)
+
 -- ==================== ACTIVE BOSS TARGET TRACKER & WARP RECOVERY ==================== --
 -- Ensures character warps to boss immediately after join and continuously streams/tracks the model
 task.spawn(function()
     while true do
         if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
         task.wait(0.5)
-
-        if State.AutoBossHop and State.ActiveBossTarget then
+        if State.Teleporting or State.IsHopping then
+            task.wait(0.5)
+        elseif State.AutoBossHop and State.ActiveBossTarget then
             local bDef = State.ActiveBossTarget
             local root, hum = GetChar()
             if root and hum and hum.Health > 0 then
@@ -12218,8 +12390,9 @@ task.spawn(function()
     while true do
         if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
         task.wait(0.1)
-
-        if State.BossHopAutoAttackOnJoin and State.ActiveBossTarget then
+        if State.Teleporting or State.IsHopping then
+            task.wait(0.5)
+        elseif State.BossHopAutoAttackOnJoin and State.ActiveBossTarget then
             local target = State.CurrentTarget
             if target and target.Parent then
                 local hp = tonumber(target:GetAttribute("HP")) or tonumber(target:GetAttribute("Health")) or 0
@@ -12420,7 +12593,9 @@ task.spawn(function()
     while true do
         if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
         task.wait(0.5)
-        if State.AutoLoot or State.ActiveBossTarget then
+        if State.Teleporting or State.IsHopping then
+            task.wait(0.5)
+        elseif State.AutoLoot or State.ActiveBossTarget then
             pcall(function()
                 Remotes.PickupDrop:FireServer(true)
                 Remotes.PickupDrop:FireServer()
@@ -12622,7 +12797,9 @@ task.spawn(function()
     while true do
         if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
         task.wait(12)
-        if State.AutoDismantle then
+        if State.Teleporting or State.IsHopping then
+            task.wait(1.0)
+        elseif State.AutoDismantle then
             pcall(function()
                 DismantleGearNow(true)
             end)
@@ -13063,6 +13240,41 @@ do
         Default = State.AutoLoot
     }):OnChanged(function(v)
         State.AutoLoot = v
+    end)
+
+    Tabs.Settings:AddSection("Movement & Speed (ความเร็วการวิ่ง)")
+
+    local WalkSpeedToggle = Tabs.Settings:AddToggle("WalkSpeedToggle", {
+        Title = "Auto Run (วิ่งความเร็วปกติของเกม)",
+        Description = "ล็อกให้ตัวละครวิ่งตลอดเวลาด้วยความเร็วปกติของเกม (WalkSpeed: 24) ไม่เดินช้า",
+        Default = (State.WalkSpeedEnabled ~= false)
+    })
+    WalkSpeedToggle:OnChanged(function(v)
+        State.WalkSpeedEnabled = v
+        SaveBossHopState(State.AutoBossHop)
+        local _, hum = GetChar()
+        if hum then
+            hum.WalkSpeed = v and (tonumber(State.WalkSpeed) or 24) or 16
+        end
+    end)
+
+    local WalkSpeedSlider = Tabs.Settings:AddSlider("WalkSpeedSlider", {
+        Title = "Run Speed (ความเร็ววิ่ง)",
+        Description = "ระดับความเร็ว (ปกติเกมเดิน: 16, ปกติเกมวิ่ง: 24)",
+        Default = State.WalkSpeed or 24,
+        Min = 16,
+        Max = 36,
+        Rounding = 0
+    })
+    WalkSpeedSlider:OnChanged(function(v)
+        State.WalkSpeed = v
+        SaveBossHopState(State.AutoBossHop)
+        if State.WalkSpeedEnabled then
+            local _, hum = GetChar()
+            if hum then
+                hum.WalkSpeed = v
+            end
+        end
     end)
 
     Tabs.Settings:AddSection("Auto Dismantle Gear (ย่อยอุปกรณ์ขยะ)")
