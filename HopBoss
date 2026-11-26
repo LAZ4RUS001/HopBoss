@@ -1,4 +1,6 @@
 -- ==================== UNIVERSAL EXECUTOR & ENVIRONMENT INITIALIZATION ==================== --
+getgenv().StreetHub_BossHop_Loaded = true
+
 if not game:IsLoaded() then
     pcall(function() game.Loaded:Wait() end)
 end
@@ -120,6 +122,7 @@ local State = {
     BossHopCustomList = {},
     BossHopWaitSpawnTime = 30,
     BossHopAutoAttackOnJoin = true,
+    AutoExec = true, -- เปิด/ปิด การรันสคริปต์อัตโนมัติเมื่อย้ายเซิร์ฟเวอร์ (Queue on Teleport & AutoExec)
     IsHopping = false,
     Teleporting = false, -- ป้องกันการ crash ระหว่าง teleport
     LastBossHopCheck = 0,
@@ -11271,6 +11274,16 @@ local BossDatabase = {
 local VisitedJobIds = {}
 VisitedJobIds[game.JobId] = true
 local FailedJobIds = {}
+local function SetExecutorAutoExec(enabled)
+    pcall(function()
+        local isf = isfile or (syn and syn.isfile)
+        local df = delfile or (syn and syn.delfile)
+        if df and isf and isf("StreetHub_AutoExec_Disabled.txt") then
+            pcall(function() df("StreetHub_AutoExec_Disabled.txt") end)
+        end
+    end)
+end
+
 local StateFile = "StreetHub_BossHopState.json"
 
 local function SaveBossHopState(isActive)
@@ -11286,6 +11299,7 @@ local function SaveBossHopState(isActive)
             CustomList = State.BossHopCustomList or {},
             WaitSpawnSec = tonumber(State.BossHopWaitSpawnTime) or 30,
             AutoAttackOnJoin = (State.BossHopAutoAttackOnJoin ~= false),
+            AutoExec = (State.AutoExec ~= false),
             GroundCombat = (State.GroundCombat ~= false),
             Visited = vList,
             Timestamp = os.time(),
@@ -11329,6 +11343,7 @@ local function LoadBossHopState()
                 if data.WebhookNotifyBossSpawningSoon ~= nil then State.WebhookNotifyBossSpawningSoon = data.WebhookNotifyBossSpawningSoon end
                 if data.WebhookNotifyDrops ~= nil then State.WebhookNotifyDrops = data.WebhookNotifyDrops end
                 if data.WebhookDropFilter ~= nil then State.WebhookDropFilter = data.WebhookDropFilter end
+                if data.AutoExec ~= nil then State.AutoExec = (data.AutoExec ~= false) end
                 if data.GroundCombat ~= nil then State.GroundCombat = data.GroundCombat end
                 if data.WalkSpeedEnabled ~= nil then State.WalkSpeedEnabled = data.WalkSpeedEnabled end
                 if data.WalkSpeed ~= nil then State.WalkSpeed = data.WalkSpeed end
@@ -11636,28 +11651,31 @@ local function PrepareForTeleport()
         end
     end)
 
-    -- Auto-execute script in next server if executor supports queue_on_teleport (with 2.0s safe load delay)
-    pcall(function()
-        local queue = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
-        if queue then
-            local scriptCode = [[
-                task.spawn(function()
-                    repeat task.wait(0.5) until game:IsLoaded() and game:GetService("Players").LocalPlayer
-                    task.wait(2.0)
-                    local rf = readfile or (syn and syn.readfile)
-                    local isf = isfile or (syn and syn.isfile)
-                    if rf and isf then
-                        if isf("Street Hub/HuntingTogether_BossHop.lua") then
-                            loadstring(rf("Street Hub/HuntingTogether_BossHop.lua"))()
-                        elseif isf("HuntingTogether_BossHop.lua") then
-                            loadstring(rf("HuntingTogether_BossHop.lua"))()
+    -- Auto-execute script in next server if AutoExec is enabled and executor supports queue_on_teleport
+    if State.AutoExec ~= false then
+        pcall(function()
+            local queue = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+            if queue then
+                local scriptCode = [[
+                    task.spawn(function()
+                        repeat task.wait(0.5) until game:IsLoaded() and game:GetService("Players").LocalPlayer
+                        task.wait(2.0)
+                        if getgenv().StreetHub_BossHop_Loaded then return end
+                        local rf = readfile or (syn and syn.readfile)
+                        local isf = isfile or (syn and syn.isfile)
+                        if rf and isf then
+                            if isf("Street Hub/HuntingTogether_BossHop.lua") then
+                                loadstring(rf("Street Hub/HuntingTogether_BossHop.lua"))()
+                            elseif isf("HuntingTogether_BossHop.lua") then
+                                loadstring(rf("HuntingTogether_BossHop.lua"))()
+                            end
                         end
-                    end
-                end)
-            ]]
-            queue(scriptCode)
-        end
-    end)
+                    end)
+                ]]
+                queue(scriptCode)
+            end
+        end)
+    end
 end
 
 -- Robust Server Scanner with cursor pagination & safe slot filtering
@@ -12509,6 +12527,18 @@ task.spawn(function()
                     if State.AutoSkills then
                         local skills = GetUsableSkills()
                         if #skills > 0 then
+                    if target ~= LastTargetSent or (now - LastTargetTime) > 1.2 then
+                        LastTargetSent = target
+                        LastTargetTime = now
+                        pcall(function()
+                            Remotes.SetTarget:FireServer(target, false, true)
+                        end)
+                    end
+
+                    -- Skill Rotation
+                    if State.AutoSkills then
+                        local skills = GetUsableSkills()
+                        if #skills > 0 then
                             local sId = skills[CurrentSkillIndex]
                             if sId then
                                 CurrentSkillIndex = (CurrentSkillIndex % #skills) + 1
@@ -13094,6 +13124,22 @@ do
                 Duration = 3
             })
         end
+    end)
+
+    local AutoExecToggle = Tabs.Boss:AddToggle("AutoExecToggle", {
+        Title = "Queue on Hop (รันสคริปต์ต่ออัตโนมัติเมื่อย้ายเซิร์ฟ)",
+        Description = "เปิด/ปิด การส่งสคริปต์ไปรันต่ออัตโนมัติเมื่อ Hop ย้ายเซิร์ฟเวอร์ (Queue on Teleport โดยไม่ต้องติดตั้งไฟล์ใน AutoExec)",
+        Default = (State.AutoExec ~= false)
+    })
+    AutoExecToggle:OnChanged(function(v)
+        State.AutoExec = v
+        SaveBossHopState(State.AutoBossHop)
+        SetExecutorAutoExec(v)
+        Fluent:Notify({
+            Title = "Street Hub · Auto Hop",
+            Content = v and "✅ เปิด Queue on Hop แล้ว (สคริปต์จะรันต่ออัตโนมัติเมื่อ Hop ย้ายเซิร์ฟ)" or "❌ ปิด Queue on Hop แล้ว (สคริปต์จะไม่รันต่อตอนย้ายเซิร์ฟ)",
+            Duration = 3.5
+        })
     end)
 
     local bossHopTargetOptions = {
