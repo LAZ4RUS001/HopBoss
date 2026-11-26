@@ -12515,4 +12515,1163 @@ task.spawn(function()
                 local hp = tonumber(target:GetAttribute("HP")) or tonumber(target:GetAttribute("Health")) or 0
                 if hp > 0 then
                     local now = os.clock()
-... [truncated for diff preview]
+                    if target ~= LastTargetSent or (now - LastTargetTime) > 1.2 then
+                        LastTargetSent = target
+                        LastTargetTime = now
+                        pcall(function()
+                            Remotes.SetTarget:FireServer(target, false, true)
+                        end)
+                    end
+
+                    -- Skill Rotation
+                    if State.AutoSkills then
+                        local skills = GetUsableSkills()
+                        if #skills > 0 then
+                            local sId = skills[CurrentSkillIndex]
+                            if sId then
+                                CurrentSkillIndex = (CurrentSkillIndex % #skills) + 1
+                                local cd = SkillCooldowns[sId] or 0
+                                if (now - cd) >= 0.5 then
+                                    SkillCooldowns[sId] = now
+                                    pcall(function()
+                                        Remotes.UseSkill:FireServer(sId, target)
+                                    end)
+                                end
+                            else
+                                CurrentSkillIndex = 1
+                            end
+                        end
+                    end
+
+                    -- Auto Dodge
+                    if State.AutoDodge then
+                        pcall(function()
+                            local isAttacking = target:GetAttribute("IsAttacking") or target:GetAttribute("CastingSkill")
+                            if isAttacking then
+                                Remotes.Dash:FireServer()
+                            end
+                        end)
+                    end
+                else
+                    -- Target dead, loot immediately and drop to ground
+                    pcall(function()
+                        Remotes.PickupDrop:FireServer(true)
+                        Remotes.PickupDrop:FireServer()
+                    end)
+                    State.CurrentTarget = nil
+                    LastTargetSent = nil
+                    local root = GetChar()
+                    RemoveHoverObjects(root)
+                end
+            end
+        end
+    end
+end)
+
+-- ==================== AUTO BOSS HOP SCAN & EXECUTION ROUTINE ==================== --
+local LastNotifiedSoonKey = nil
+local LastNotifiedLiveBoss = nil
+local ServerJoinedClock = os.clock()
+local NotifiedScanStarting = false
+local HadLiveBossInServer = false
+local BossKilledLootDelayUntil = 0
+
+task.spawn(function()
+    while true do
+        if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
+        task.wait(1.0)
+
+        if State.AutoBossHop and not State.IsHopping then
+            local timeSinceJoin = os.clock() - ServerJoinedClock
+            local isLive, liveBossDef, liveReason, remainingTime = CheckBossHopTargetLive()
+
+            if isLive and liveBossDef then
+                if liveReason == "spawning_soon" and remainingTime and remainingTime > 0 then
+                    -- Spawning soon: STAY IN SERVER!
+                    local notifyKey = (liveBossDef.alias or liveBossDef.name) .. "_" .. tostring(math.floor(remainingTime / 15))
+                    if LastNotifiedSoonKey ~= notifyKey then
+                        LastNotifiedSoonKey = notifyKey
+                        local bName = liveBossDef.alias or liveBossDef.name
+                        Fluent:Notify({
+                            Title = "Street Hub · บอสกำลังจะเกิด!",
+                            Content = string.format("⏳ บอส %s กำลังจะเกิดใน %d วินาที! พักการ Hop เพื่อรอในเซิร์ฟนี้...", bName, math.ceil(remainingTime)),
+                            Duration = 5
+                        })
+                        -- Dispatch Discord Webhook: Boss Spawning Soon
+                        SendWebhookBossSpawningSoon(liveBossDef, remainingTime)
+                    end
+                else
+                    -- BOSS IS LIVE!
+                    State.NoBossCountdownActive = false
+                    HadLiveBossInServer = true
+                    BossKilledLootDelayUntil = 0
+                    State.ActiveBossTarget = liveBossDef
+
+                    local bName = liveBossDef.alias or liveBossDef.name
+                    if LastNotifiedLiveBoss ~= bName then
+                        LastNotifiedLiveBoss = bName
+                        local hpText = ""
+                        if type(remainingTime) == "number" and remainingTime > 0 then
+                            hpText = string.format(" (HP: %s)", tostring(remainingTime))
+                        end
+
+                        Fluent:Notify({
+                            Title = "Street Hub · 🎯 เจอบอสแล้ว!",
+                            Content = string.format("🎉 พบ %s%s! หยุดย้ายเซิร์ฟเวอร์ชั่วคราวเพื่อเข้าตีบอส (เมื่อบอสตายจะ Hop ต่ออัตโนมัติ)", bName, hpText),
+                            Duration = 7
+                        })
+
+                        -- Dispatch Discord Webhook: Boss Found!
+                        SendWebhookBossFound(liveBossDef, remainingTime)
+
+                        -- Find target monster model & warp
+                        task.spawn(function()
+                            task.wait(0.3)
+                            local mf = workspace:FindFirstChild("Monsters")
+                            local foundMob = nil
+                            if mf then
+                                for _, mob in ipairs(mf:GetChildren()) do
+                                    local mId = (mob:GetAttribute("MonsterId") or mob.Name or ""):lower()
+                                    local dName = (mob:GetAttribute("DisplayName") or mob.Name or ""):lower()
+                                    if (liveBossDef.id and (mId == liveBossDef.id:lower() or mId:find(liveBossDef.id:lower(), 1, true))) or
+                                       (liveBossDef.alias and (dName == liveBossDef.alias:lower() or dName:find(liveBossDef.alias:lower(), 1, true))) then
+                                        foundMob = mob
+                                        break
+                                    end
+                                end
+                            end
+
+                            State.CurrentTarget = foundMob
+                            if State.BossHopAutoAttackOnJoin then
+                                TeleportToBoss(liveBossDef, foundMob)
+                            end
+                        end)
+                    end
+                end
+            elseif liveReason ~= "no_selection" and liveReason ~= "invalid" then
+                -- No target boss is live
+                local root = GetChar()
+                RemoveHoverObjects(root)
+
+                if HadLiveBossInServer then
+                    -- The boss in this server has been defeated!
+                    if not State.BossDefeatedCountdownActive and not State.IsHopping and not State.Teleporting then
+                        State.BossDefeatedCountdownActive = true
+                        HadLiveBossInServer = false
+                        LastNotifiedLiveBoss = nil
+                        State.ActiveBossTarget = nil
+                        State.CurrentTarget = nil
+                        RemoveHoverObjects(root)
+
+                        -- Dispatch Discord Webhook: Boss Defeated!
+                        SendWebhookBossDefeated(liveBossDef or State.ActiveBossTarget)
+
+                        task.spawn(function()
+                            for cd = 10, 1, -1 do
+                                if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
+                                if not State.AutoBossHop or State.IsHopping or State.Teleporting then
+                                    State.BossDefeatedCountdownActive = false
+                                    break
+                                end
+
+                                -- Auto Loot continuously during the 10-second buffer
+                                pcall(function()
+                                    Remotes.PickupDrop:FireServer(true)
+                                    Remotes.PickupDrop:FireServer()
+                                end)
+
+                                -- Realtime countdown notification (at 10s, 7s, 5s, 3s, 2s, 1s)
+                                if cd == 10 or cd == 7 or cd == 5 or cd <= 3 then
+                                    Fluent:Notify({
+                                        Title = "Street Hub · 💀 บอสถูกกำจัดแล้ว! (Cooldown 10 วิ)",
+                                        Content = string.format("🎉 กำจัดบอสสำเร็จ! เก็บของ & ย้ายเซิร์ฟเวอร์ในอีก %d วินาที (ป้องกันเกมหลุด)...", cd),
+                                        Duration = 1.2
+                                    })
+                                end
+
+                                if cd == 3 and State.AutoDismantle then
+                                    pcall(function() DismantleGearNow(true) end)
+                                end
+
+                                task.wait(1.0)
+                            end
+
+                            State.BossDefeatedCountdownActive = false
+                            if State.AutoBossHop and not State.IsHopping and not State.Teleporting then
+                                if State.AutoDismantle then
+                                    pcall(function() DismantleGearNow(true) end)
+                                end
+                                ServerHop("💀 กำจัดบอสสำเร็จ (คูลดาวน์ครบ 10 วิ) กำลัง Hop ไปล่าบอสเซิร์ฟเวอร์ถัดไป...")
+                            end
+                        end)
+                    end
+                else
+                    -- No boss live in this server: 10s cooldown countdown to prevent game crash / disconnect
+                    if not State.NoBossCountdownActive and not State.IsHopping and not State.Teleporting then
+                        State.NoBossCountdownActive = true
+                        task.spawn(function()
+                            for cd = 10, 1, -1 do
+                                if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
+                                if not State.AutoBossHop or State.IsHopping or State.Teleporting then
+                                    State.NoBossCountdownActive = false
+                                    break
+                                end
+
+                                -- Check if boss spawned or is about to spawn during countdown
+                                local isLiveNow, liveBossNow, reasonNow, remTime = CheckBossHopTargetLive()
+                                if isLiveNow and liveBossNow then
+                                    local bName = liveBossNow.alias or liveBossNow.name or "Target Boss"
+                                    Fluent:Notify({
+                                        Title = "Street Hub · 🎯 พบบอสแล้ว!",
+                                        Content = string.format("ตรวจพบบอส %s! ยกเลิกการ Hop ทันที กำลังเข้าโจมตี...", bName),
+                                        Duration = 4
+                                    })
+                                    State.NoBossCountdownActive = false
+                                    return
+                                end
+
+                                -- Countdown notification (at 10s, 7s, 5s, 3s, 2s, 1s)
+                                if cd == 10 or cd == 7 or cd == 5 or cd <= 3 then
+                                    Fluent:Notify({
+                                        Title = "Street Hub · ⏳ ไม่พบบอส (Cooldown 10 วิ)",
+                                        Content = string.format("❌ ไม่พบบอสในเซิร์ฟนี้! กำลังย้ายเซิร์ฟในอีก %d วินาที (ป้องกันเกมหลุด)...", cd),
+                                        Duration = 1.2
+                                    })
+                                end
+                                task.wait(1.0)
+                            end
+
+                            State.NoBossCountdownActive = false
+                            if State.AutoBossHop and not State.IsHopping and not State.Teleporting then
+                                local isLiveNow, liveBossNow = CheckBossHopTargetLive()
+                                if not isLiveNow then
+                                    ServerHop("❌ ไม่พบบอสเป้าหมาย (คูลดาวน์ครบ 10 วิ) กำลังสุ่มย้ายเซิร์ฟเวอร์ใหม่...")
+                                end
+                            end
+                        end)
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- Auto Loot Background Thread
+task.spawn(function()
+    while true do
+        if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
+        task.wait(0.5)
+        if State.Teleporting or State.IsHopping then
+            task.wait(0.5)
+        elseif State.AutoLoot or State.ActiveBossTarget then
+            pcall(function()
+                Remotes.PickupDrop:FireServer(true)
+                Remotes.PickupDrop:FireServer()
+            end)
+        end
+    end
+end)
+
+-- ==================== GEAR DISMANTLE HANDLER ==================== --
+local function DismissSalvagePopup()
+    pcall(function()
+        local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+        if not pGui then return end
+        local salvageGui = pGui:FindFirstChild("LumiSalvageResult")
+        if not salvageGui then return end
+        local holder = salvageGui:FindFirstChild("Holder")
+        if not holder then return end
+
+        for _, child in ipairs(holder:GetChildren()) do
+            if child.Name == "PopupLayer" or child:IsA("GuiObject") then
+                local btn = child:FindFirstChild("KitButton", true)
+                if btn and btn:IsA("GuiButton") and firesignal then
+                    pcall(function() firesignal(btn.MouseButton1Click) end)
+                end
+                child:Destroy()
+            end
+        end
+    end)
+end
+
+-- Persistent listener to auto-close Dismantle Complete popup
+task.spawn(function()
+    local function hookSalvageGui(gui)
+        local holder = gui:WaitForChild("Holder", 5)
+        if holder then
+            holder.ChildAdded:Connect(function(child)
+                if State.AutoCloseSalvagePopup then
+                    task.wait(0.2)
+                    DismissSalvagePopup()
+                end
+            end)
+        end
+    end
+
+    local pGui = LocalPlayer:WaitForChild("PlayerGui", 10)
+    if pGui then
+        local existing = pGui:FindFirstChild("LumiSalvageResult")
+        if existing then hookSalvageGui(existing) end
+        pGui.ChildAdded:Connect(function(child)
+            if child.Name == "LumiSalvageResult" then
+                hookSalvageGui(child)
+            end
+        end)
+    end
+
+    pcall(function()
+        Remotes:WaitForChild("BagSalvage", 10).OnClientEvent:Connect(function()
+            if State.AutoCloseSalvagePopup then
+                task.delay(0.25, function()
+                    DismissSalvagePopup()
+                end)
+            end
+        end)
+    end)
+end)
+
+local function DismantleGearNow(silent)
+    local okGears, gears = pcall(function()
+        local raw = LocalPlayer:GetAttribute("GearJson") or "{}"
+        return HttpService:JSONDecode(raw)
+    end)
+    if not okGears or type(gears) ~= "table" then
+        if not silent then
+            Fluent:Notify({
+                Title = "Street Hub · Dismantle",
+                Content = "ไม่พบข้อมูลอุปกรณ์ในกระเป๋า!",
+                Duration = 2.5
+            })
+        end
+        return
+    end
+
+    -- 1. Read Locks
+    local locks = {}
+    pcall(function()
+        local raw = LocalPlayer:GetAttribute("LocksJson") or "{}"
+        local decoded = HttpService:JSONDecode(raw)
+        if type(decoded) == "table" then
+            locks = decoded
+        end
+    end)
+
+    -- 2. Read Equipped Items
+    local isEquipped = {}
+    local weaponId = LocalPlayer:GetAttribute("WeaponId")
+    if weaponId and weaponId ~= "" then
+        isEquipped[weaponId] = true
+    end
+    pcall(function()
+        local raw = LocalPlayer:GetAttribute("EquipJson") or "{}"
+        local decoded = HttpService:JSONDecode(raw)
+        if type(decoded) == "table" then
+            for _, ref in pairs(decoded) do
+                if type(ref) == "string" and ref ~= "" then
+                    isEquipped[ref] = true
+                end
+            end
+        end
+    end)
+
+    -- 3. Read Superior / Upgrade scores if KeepSuperiorGear is true
+    local superior = {}
+    if State.KeepSuperiorGear then
+        local okDiff, diffs = pcall(function()
+            return Remotes.GearPreviewAll:InvokeServer()
+        end)
+        if okDiff and type(diffs) == "table" then
+            for ref, score in pairs(diffs) do
+                if type(score) == "number" and score > 0 then
+                    superior[ref] = true
+                end
+            end
+        end
+    end
+
+    -- 4. Determine Max Tier
+    local maxTier = 4
+    if State.DismantleTier == "Tier I - V" then
+        maxTier = 5
+    elseif State.DismantleTier == "Tier I - III" then
+        maxTier = 3
+    elseif State.DismantleTier == "Tier I - II" then
+        maxTier = 2
+    else
+        maxTier = 4
+    end
+
+    -- 5. Collect Candidates
+    local toDismantle = {}
+    for ref, item in pairs(gears) do
+        if type(item) == "table" and type(ref) == "string" then
+            local tier = tonumber(item.T)
+            -- Game rules: Only Tier 1 to 5 can be dismantled (Tier 6 is protected)
+            if tier and tier >= 1 and tier <= maxTier and tier <= 5 then
+                local locked = locks[ref] == true
+                local equipped = isEquipped[ref] == true
+                local isSuper = superior[ref] == true
+                if not locked and not equipped and not isSuper then
+                    table.insert(toDismantle, ref)
+                end
+            end
+        end
+    end
+
+    if #toDismantle == 0 then
+        if not silent then
+            Fluent:Notify({
+                Title = "Street Hub · Dismantle",
+                Content = "ไม่พบอุปกรณ์ขยะที่ตรงเงื่อนไขการย่อยในกระเป๋า!",
+                Duration = 2.5
+            })
+        end
+        return
+    end
+
+    -- 6. Fire Remotes.BagSalvage in safe batches of 50
+    local totalDismantled = #toDismantle
+    local chunkSize = 50
+    for i = 1, totalDismantled, chunkSize do
+        local chunk = {}
+        for j = i, math.min(i + chunkSize - 1, totalDismantled) do
+            table.insert(chunk, toDismantle[j])
+        end
+        pcall(function()
+            Remotes.BagSalvage:FireServer(chunk)
+        end)
+        if totalDismantled > chunkSize then
+            task.wait(0.2)
+        end
+    end
+
+    if State.AutoCloseSalvagePopup then
+        task.delay(0.25, function()
+            DismissSalvagePopup()
+        end)
+    end
+
+    if not silent then
+        Fluent:Notify({
+            Title = "Street Hub · Dismantle",
+            Content = string.format("ย่อยอุปกรณ์ขยะเรียบร้อยแล้ว %d ชิ้น!", totalDismantled),
+            Duration = 3
+        })
+    end
+end
+
+-- Auto Dismantle Background Thread (runs every 12s)
+task.spawn(function()
+    while true do
+        if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
+        task.wait(12)
+        if State.Teleporting or State.IsHopping then
+            task.wait(1.0)
+        elseif State.AutoDismantle then
+            pcall(function()
+                DismantleGearNow(true)
+            end)
+        end
+    end
+end)
+
+
+-- ==================== STREET HUB EMBEDDED LOGO ASSET LOADER ==================== --
+local STREET_HUB_LOGO_B64 = "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"
+
+local function DecodeBase64(data)
+    local b = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    data = string.gsub(data, "[^" .. b .. "=]", "")
+    return (data:gsub(".", function(x)
+        if x == "=" then return "" end
+        local r, f = "", (b:find(x) - 1)
+        for i = 6, 1, -1 do r = r .. (f % 2^i - f % 2^(i - 1) > 0 and "1" or "0") end
+        return r
+    end):gsub("%d%d%d%d%d%d%d%d", function(x)
+        local c = 0
+        for i = 1, 8 do c = c + (x:sub(i, i) == "1" and 2^(8 - i) or 0) end
+        return string.char(c)
+    end))
+end
+
+local StreetHubLogoAsset = nil
+local function GetStreetHubLogo()
+    if StreetHubLogoAsset then return StreetHubLogoAsset end
+    pcall(function()
+        if writefile and getcustomasset then
+            local fileName = "streethub_logo.png"
+            if not isfile or not isfile(fileName) then
+                local binary = DecodeBase64(STREET_HUB_LOGO_B64)
+                writefile(fileName, binary)
+            end
+            StreetHubLogoAsset = getcustomasset(fileName)
+        end
+    end)
+    return StreetHubLogoAsset or "rbxassetid://10734975486"
+end
+
+
+-- ==================== CREATE STREET HUB SHADCN WINDOW & TABS ==================== --
+local Camera = workspace.CurrentCamera
+local vpSize = Camera and Camera.ViewportSize or Vector2.new(1920, 1080)
+local isSmallScreen = vpSize.X < 900 or vpSize.Y < 550
+local defaultWidth = isSmallScreen and math.clamp(vpSize.X - 35, 330, 520) or 700
+local defaultHeight = isSmallScreen and math.clamp(vpSize.Y - 45, 290, 420) or 500
+
+local Window = UI:CreateWindow({
+    Title = "Street Hub",
+    Subtitle = "Hunting Together · Boss Hop 💀",
+    Icon = GetStreetHubLogo(),
+    Theme = "Dark",
+    Accent = "Red",
+    ToggleKey = Enum.KeyCode.RightShift,
+    GamepadToggleKey = Enum.KeyCode.ButtonSelect,
+    Island = false,
+    Size = UDim2.fromOffset(defaultWidth, defaultHeight)
+})
+Window.Frame = Window._holder
+Window.Root = Window._root
+Window.GUI = Window.Instance
+Fluent.GUI = Window.Instance
+
+local function ToggleStreetHubWindow()
+    if not Window then return end
+    pcall(function()
+        local nextVis = not Window._visible
+        Window:SetVisible(nextVis)
+        if Window._holder then
+            Window._holder.Visible = nextVis
+        end
+    end)
+end
+
+function Window:Minimize()
+    ToggleStreetHubWindow()
+end
+
+pcall(function()
+    getgenv().StreetHub_Toggle = ToggleStreetHubWindow
+    getgenv().StreetHub_BossHop_Toggle = ToggleStreetHubWindow
+    getgenv().StreetHub_Window = Window
+end)
+
+-- Universal Multi-Key UI Toggle Listener (RightShift, RightControl, LeftControl, Insert, F8)
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightShift
+    or input.KeyCode == Enum.KeyCode.RightControl
+    or input.KeyCode == Enum.KeyCode.LeftControl
+    or input.KeyCode == Enum.KeyCode.Insert
+    or input.KeyCode == Enum.KeyCode.F8 then
+        ToggleStreetHubWindow()
+    end
+end)
+
+local _rawSelectTab = Window.SelectTab
+function Window:SelectTab(tabOrIdx)
+    local targetTab = tabOrIdx
+    if type(tabOrIdx) == "number" then
+        targetTab = self._tabs and self._tabs[tabOrIdx]
+    elseif type(tabOrIdx) == "table" and tabOrIdx._raw then
+        targetTab = tabOrIdx._raw
+    end
+    if targetTab then
+        _rawSelectTab(self, targetTab)
+    end
+end
+
+local Tabs = {
+    Boss = WrapTab(Window:AddTab({ Title = "Boss Server Hop", Icon = "skull" })),
+    Webhook = WrapTab(Window:AddTab({ Title = "Discord Webhook", Icon = "bell" })),
+    Settings = WrapTab(Window:AddTab({ Title = "Combat / Config", Icon = "settings" })),
+    Theme = WrapTab(Window:AddTab({ Title = "Theme", Icon = "paintbrush" }))
+}
+Tabs.Theme:AddThemeSettings()
+
+-- ==================== TAB 1: BOSS SERVER HOP & RADAR ==================== --
+do
+    Tabs.Boss:AddParagraph({
+        Title = "ระบบย้ายเซิร์ฟเวอร์ค้นหาบอส (Boss Server Hop)",
+        Content = "ระบบตรวจจับบอสข้ามเซิร์ฟเวอร์อัตโนมัติ สแกนหาบอสโลกและบอสฟิลด์ทั้งหมด พร้อมเรดาร์นับถอยหลัง Realtime"
+    })
+
+    Tabs.Boss:AddSection("ระบบย้ายเซิร์ฟเวอร์ค้นหาบอส (Boss Server Hop)")
+
+    local AutoBossHopToggle = Tabs.Boss:AddToggle("AutoBossHopToggle", {
+        Title = "Server Hop when Target Boss Alive",
+        Description = "Hops between servers to hunt target bosses; pauses while fighting and resumes hopping when boss dies",
+        Default = State.AutoBossHop
+    })
+    AutoBossHopToggle:OnChanged(function(v)
+        State.AutoBossHop = v
+        SaveBossHopState(v)
+        if v then
+            Fluent:Notify({
+                Title = "Street Hub · Boss Hop",
+                Content = "เปิดระบบค้นหาบอสข้ามเซิร์ฟเวอร์แล้ว กำลังเริ่มสแกน...",
+                Duration = 3
+            })
+        end
+    end)
+
+    local AutoExecToggle = Tabs.Boss:AddToggle("AutoExecToggle", {
+        Title = "Queue on Hop (รันสคริปต์ต่ออัตโนมัติเมื่อย้ายเซิร์ฟ)",
+        Description = "เปิด/ปิด การส่งสคริปต์ไปรันต่ออัตโนมัติเมื่อ Hop ย้ายเซิร์ฟเวอร์ (Queue on Teleport โดยไม่ต้องติดตั้งไฟล์ใน AutoExec)",
+        Default = (State.AutoExec ~= false)
+    })
+    AutoExecToggle:OnChanged(function(v)
+        State.AutoExec = v
+        SaveBossHopState(State.AutoBossHop)
+        SetExecutorAutoExec(v)
+        Fluent:Notify({
+            Title = "Street Hub · Auto Hop",
+            Content = v and "✅ เปิด Queue on Hop แล้ว (สคริปต์จะรันต่ออัตโนมัติเมื่อ Hop ย้ายเซิร์ฟ)" or "❌ ปิด Queue on Hop แล้ว (สคริปต์จะไม่รันต่อตอนย้ายเซิร์ฟ)",
+            Duration = 3.5
+        })
+    end)
+
+    local bossHopTargetOptions = {
+        "Any Boss (World + Field)",
+        "Any World Boss",
+        "Any Field Boss",
+        "Custom Boss Hop Selection",
+        "Gorilla King",
+        "Whitefang Sabertooth",
+        "Obsidian Pharaoh",
+        "Tempest Dragon King",
+        "Volcano Turtle King",
+        "Lightning Dragon",
+        "Pumpkin King",
+        "Rabbit King",
+        "Boar King",
+        "Bear King",
+        "Hyena King",
+        "Rhino King",
+        "Tiger King",
+        "Scorpion King",
+        "Ram King",
+        "Stone Golem King",
+        "Polar Bear King",
+        "Wolf King",
+        "Ice Golem King",
+        "Great Lava Turtle",
+        "Fire Bat Lord",
+        "Hellhound Alpha",
+        "Pumpkin Spider"
+    }
+
+    local BossHopTargetDropdown = Tabs.Boss:AddDropdown("BossHopTargetDropdown", {
+        Title = "เลือกบอสที่ต้องการ Hop หา",
+        Description = "Select whether to hop for any world boss, your selected target, or custom boss list",
+        Values = bossHopTargetOptions,
+        Default = State.BossHopTarget or "Tempest Dragon King",
+        Multi = false
+    })
+    BossHopTargetDropdown:OnChanged(function(v)
+        State.BossHopTarget = v
+        if State.AutoBossHop then SaveBossHopState(true) end
+    end)
+
+    local customBossOptions = {}
+    for _, bDef in ipairs(BossDatabase) do
+        table.insert(customBossOptions, bDef.alias or bDef.name)
+    end
+
+    local BossHopMultiDropdown = Tabs.Boss:AddDropdown("BossHopMultiDropdown", {
+        Title = "Select Custom Bosses (Multi-Select)",
+        Description = "Used when 'Custom Boss Hop Selection' is chosen above",
+        Values = customBossOptions,
+        Default = State.BossHopCustomList or {},
+        Multi = true
+    })
+    BossHopMultiDropdown:OnChanged(function(v)
+        State.BossHopCustomList = v
+        if State.AutoBossHop then SaveBossHopState(true) end
+    end)
+
+    local BossHopWaitSpawnSlider = Tabs.Boss:AddSlider("BossHopWaitSpawnSlider", {
+        Title = "รอเซิร์ฟเวอร์เดิมถ้าบอสใกล้เกิดภายใน (วินาที)",
+        Description = "Stay in server if boss will spawn within this many seconds (default: 30s)",
+        Default = State.BossHopWaitSpawnTime or 30,
+        Min = 5,
+        Max = 120,
+        Step = 1,
+        Rounding = 0
+    })
+    BossHopWaitSpawnSlider:OnChanged(function(v)
+        local num = tonumber(v)
+        State.BossHopWaitSpawnTime = (num and num > 0) and num or 30
+        if State.AutoBossHop then SaveBossHopState(true) end
+    end)
+
+    local BossHopAutoAttackToggle = Tabs.Boss:AddToggle("BossHopAutoAttackToggle", {
+        Title = "Auto Attack Boss On Join",
+        Description = "Automatically begins attacking the boss when arriving in a server with boss alive",
+        Default = (State.BossHopAutoAttackOnJoin ~= false)
+    })
+    BossHopAutoAttackToggle:OnChanged(function(v)
+        State.BossHopAutoAttackOnJoin = v
+        if State.AutoBossHop then SaveBossHopState(true) end
+    end)
+
+    Tabs.Boss:AddButton({
+        Title = "Hop for Boss Now (Manual)",
+        Description = "Instantly hops to a new server to find the target boss",
+        Callback = function()
+            ServerHop("กำลังค้นหาเซิร์ฟเวอร์ที่มีบอสเกิด...")
+        end
+    })
+
+    Tabs.Boss:AddButton({
+        Title = "หยุดการ Hop หาบอส (Stop Hop)",
+        Description = "Turns off Auto Boss Hop and saves state",
+        Callback = function()
+            State.AutoBossHop = false
+            if AutoBossHopToggle then AutoBossHopToggle:SetValue(false) end
+            SaveBossHopState(false)
+            local root = GetChar()
+            RemoveHoverObjects(root)
+            Fluent:Notify({
+                Title = "Street Hub · Boss Hop",
+                Content = "ปิดระบบค้นหาบอสข้ามเซิร์ฟเวอร์แล้ว",
+                Duration = 2.5
+            })
+        end
+    })
+
+    Tabs.Boss:AddButton({
+        Title = "แก้ตัวลอย / ลงพื้นทันที (Drop to Ground)",
+        Description = "ล้าง BodyVelocity และบังคับให้ตัวละครตกลงมายืนบนพื้นทันที",
+        Callback = function()
+            local root = GetChar()
+            RemoveHoverObjects(root)
+            Fluent:Notify({
+                Title = "Street Hub · Physics Reset",
+                Content = "แก้ตัวลอยเรียบร้อย! ตัวละครกลับมายืนบนพื้นแล้ว",
+                Duration = 2.5
+            })
+        end
+    })
+
+    Tabs.Boss:AddSection("เรดาร์ตรวจจับบอส & เวลานับถอยหลัง (Live Radar)")
+
+    local BossRadarParagraph = Tabs.Boss:AddParagraph({
+        Title = "เรดาร์ตรวจจับบอส & เวลานับถอยหลัง (Live Radar)",
+        Content = "กำลังสแกนสถานะบอสในเซิร์ฟเวอร์..."
+    })
+
+    Tabs.Boss:AddButton({
+        Title = "รีเฟรชเรดาร์บอสทันที",
+        Description = "สแกนหาบอสโลกและบอสฟิลด์ทั้งหมดเพื่อตรวจจับสถานะและเวลานับถอยหลัง",
+        Callback = function()
+            UpdateBossRadar(BossRadarParagraph)
+        end
+    })
+
+    -- Auto Refresh Live Radar every 2.5s
+    task.spawn(function()
+        while true do
+            if _G.StreetHub_BossHopInstance ~= ScriptInstanceId then break end
+            task.wait(2.5)
+            pcall(function()
+                UpdateBossRadar(BossRadarParagraph)
+            end)
+        end
+    end)
+end
+
+-- ==================== TAB 2: DISCORD WEBHOOK ALERTS ==================== --
+do
+    Tabs.Webhook:AddParagraph({
+        Title = "Discord Webhook Notification Engine",
+        Content = "ส่งการแจ้งเตือนแบบเรียลไทม์เข้าห้อง Discord เมื่อพบบอส, ปราบบอสสำเร็จ, บอสใกล้เกิด และไอเทม/การ์ดดรอป"
+    })
+
+    Tabs.Webhook:AddSection("Discord Webhook Configuration")
+
+    local WebhookUrlInput = Tabs.Webhook:AddInput("WebhookUrlInput", {
+        Title = "Discord Webhook URL",
+        Description = "Enter your Discord Webhook URL (ลิงก์ Webhook จาก Discord Server)",
+        Default = State.WebhookUrl or "",
+        Placeholder = "https://discord.com/api/webhooks/...",
+        Numeric = false,
+        Finished = false,
+        Callback = function(val)
+            State.WebhookUrl = val
+            SaveBossHopState(State.AutoBossHop)
+        end
+    })
+
+    local WebhookMainToggle = Tabs.Webhook:AddToggle("WebhookMainToggle", {
+        Title = "Enable Discord Webhook",
+        Description = "Turn on/off all Discord notifications",
+        Default = State.WebhookEnabled
+    })
+    WebhookMainToggle:OnChanged(function(v)
+        State.WebhookEnabled = v
+        SaveBossHopState(State.AutoBossHop)
+        Fluent:Notify({
+            Title = "Street Hub · Webhook",
+            Content = v and "เปิดการแจ้งเตือน Discord Webhook แล้ว" or "ปิดการแจ้งเตือน Discord Webhook",
+            Duration = 2.5
+        })
+    end)
+
+    Tabs.Webhook:AddSection("Alert Triggers (เลือกประเภทการแจ้งเตือน)")
+
+    Tabs.Webhook:AddToggle("NotifyBossFoundToggle", {
+        Title = "Alert on Boss Found (พบเจอบอสเป้าหมาย)",
+        Description = "Sends embed alert when target boss is detected live in server",
+        Default = (State.WebhookNotifyBossFound ~= false)
+    }):OnChanged(function(v)
+        State.WebhookNotifyBossFound = v
+        SaveBossHopState(State.AutoBossHop)
+    end)
+
+    Tabs.Webhook:AddToggle("NotifyBossDefeatedToggle", {
+        Title = "Alert on Boss Defeated (ปราบบอสสำเร็จ)",
+        Description = "Sends alert when target boss dies in server",
+        Default = (State.WebhookNotifyBossDefeated ~= false)
+    }):OnChanged(function(v)
+        State.WebhookNotifyBossDefeated = v
+        SaveBossHopState(State.AutoBossHop)
+    end)
+
+    Tabs.Webhook:AddToggle("NotifyBossSpawningSoonToggle", {
+        Title = "Alert on Boss Spawning Soon (บอสใกล้เกิด)",
+        Description = "Sends alert when a world boss countdown is within wait slider",
+        Default = (State.WebhookNotifyBossSpawningSoon ~= false)
+    }):OnChanged(function(v)
+        State.WebhookNotifyBossSpawningSoon = v
+        SaveBossHopState(State.AutoBossHop)
+    end)
+
+    Tabs.Webhook:AddToggle("NotifyDropsToggle", {
+        Title = "Alert on Drops & Cards (ของดรอป & การ์ด)",
+        Description = "Sends alert when boss drops rare gear or monster cards",
+        Default = (State.WebhookNotifyDrops ~= false)
+    }):OnChanged(function(v)
+        State.WebhookNotifyDrops = v
+        SaveBossHopState(State.AutoBossHop)
+    end)
+
+    Tabs.Webhook:AddDropdown("WebhookDropFilterDropdown", {
+        Title = "Drop Alert Filter",
+        Description = "Filter which items trigger Discord notifications",
+        Values = {"Gear & Cards Only", "Cards Only", "All Drops"},
+        Multi = false,
+        Default = State.WebhookDropFilter or "Gear & Cards Only"
+    }):OnChanged(function(v)
+        State.WebhookDropFilter = v
+        SaveBossHopState(State.AutoBossHop)
+    end)
+
+    Tabs.Webhook:AddButton({
+        Title = "Send Test Webhook (ทดสอบส่ง Webhook)",
+        Description = "Sends a test message to your Discord webhook to verify connection",
+        Callback = function()
+            if not State.WebhookUrl or State.WebhookUrl == "" then
+                Fluent:Notify({
+                    Title = "Street Hub · Webhook",
+                    Content = "กรุณากรอก Discord Webhook URL ก่อนกดทดสอบ!",
+                    Duration = 3
+                })
+                return
+            end
+
+            local pName = LocalPlayer.Name
+            local pDisplay = LocalPlayer.DisplayName
+            local level = LocalPlayer:GetAttribute("Level") or 99
+            local playerCount = #Players:GetPlayers()
+            local jobIdShort = game.JobId:sub(1, 8) .. "..."
+
+            local desc = string.format("ระบบแจ้งเตือน Discord Webhook เชื่อมต่อสำเร็จและพร้อมทำงาน!\n\n> 👤 **ผู้เล่น:** `%s` (@%s) · Lv.%s\n> 🎯 **บอสเป้าหมาย:** `%s`\n> 🌐 **เซิร์ฟเวอร์:** `%s` (%d คน)\n> 🛡️ **สถานะ:** ระบบพร้อมล่าบอส",
+                pDisplay, pName, tostring(level), tostring(State.BossHopTarget), jobIdShort, playerCount)
+
+            local testPayload = {
+                username = "Street Hub · Webhook Test",
+                avatar_url = "https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua",
+                embeds = {
+                    {
+                        title = "🔔 เชื่อมต่อ Discord Webhook สำเร็จ!",
+                        description = desc,
+                        color = 0x5865F2,
+                        footer = {
+                            text = "Street Hub · Hunting Together"
+                        },
+                        timestamp = DateTime.now():ToIsoDate()
+                    }
+                }
+            }
+
+            SendDiscordWebhookPayload(testPayload)
+            Fluent:Notify({
+                Title = "Street Hub · Webhook",
+                Content = "ส่งข้อความทดสอบไปยัง Discord แล้ว!",
+                Duration = 3
+            })
+        end
+    })
+end
+
+-- ==================== TAB 3: COMBAT CONFIGURATION ==================== --
+do
+    Tabs.Settings:AddSection("Combat Settings")
+
+    Tabs.Settings:AddToggle("GroundCombatToggle", {
+        Title = "Ground Combat Mode (ยืนบนพื้น ไม่ลอยตัว)",
+        Description = "ยืนตีบนพื้นด้านหลังบอส ขาแตะพื้นตลอดเวลา ไม่บิน/ไม่ลอยค้างกลางอากาศ",
+        Default = (State.GroundCombat ~= false)
+    }):OnChanged(function(v)
+        State.GroundCombat = v
+        SaveBossHopState(State.AutoBossHop)
+        local root = GetChar()
+        if v and root then
+            RemoveHoverObjects(root)
+        end
+    end)
+
+    Tabs.Settings:AddToggle("AutoSkillsToggle", {
+        Title = "Auto Cast Skills",
+        Description = "Automatically cycles and casts all equipped active skills on boss",
+        Default = State.AutoSkills
+    }):OnChanged(function(v)
+        State.AutoSkills = v
+    end)
+
+    Tabs.Settings:AddToggle("AutoDodgeToggle", {
+        Title = "Auto Dodge Boss Attacks",
+        Description = "Uses invincible dash roll (i-frame) when boss attacks",
+        Default = State.AutoDodge
+    }):OnChanged(function(v)
+        State.AutoDodge = v
+    end)
+
+    Tabs.Settings:AddToggle("AutoLootToggle", {
+        Title = "Auto Loot Drops & Chests",
+        Description = "Automatically picks up all drops, cards, and chests after boss dies",
+        Default = State.AutoLoot
+    }):OnChanged(function(v)
+        State.AutoLoot = v
+    end)
+
+    Tabs.Settings:AddSection("Movement & Speed (ความเร็วการวิ่ง)")
+
+    local WalkSpeedToggle = Tabs.Settings:AddToggle("WalkSpeedToggle", {
+        Title = "Auto Run (วิ่งความเร็วปกติของเกม)",
+        Description = "ล็อกให้ตัวละครวิ่งตลอดเวลาด้วยความเร็วปกติของเกม (WalkSpeed: 26) ไม่หมดแรง ไม่เดินช้า",
+        Default = (State.WalkSpeedEnabled ~= false)
+    })
+    WalkSpeedToggle:OnChanged(function(v)
+        State.WalkSpeedEnabled = v
+        SaveBossHopState(State.AutoBossHop)
+        local _, hum = GetChar()
+        if hum then
+            hum.WalkSpeed = v and (tonumber(State.WalkSpeed) or 26) or 16
+        end
+        if not v then
+            pcall(function()
+                LocalPlayer:SetAttribute("LumiSprintLock", false)
+                LocalPlayer:SetAttribute("OptAutoRun", false)
+            end)
+        end
+    end)
+
+    local WalkSpeedSlider = Tabs.Settings:AddSlider("WalkSpeedSlider", {
+        Title = "Run Speed (ความเร็ววิ่ง)",
+        Description = "ระดับความเร็ว (ปกติเกมเดิน: 16, ปกติเกมวิ่ง: 26)",
+        Default = tonumber(State.WalkSpeed) or 26,
+        Min = 16,
+        Max = 60,
+        Rounding = 0
+    })
+    WalkSpeedSlider:OnChanged(function(v)
+        State.WalkSpeed = v
+        SaveBossHopState(State.AutoBossHop)
+        if State.WalkSpeedEnabled then
+            local _, hum = GetChar()
+            if hum then
+                hum.WalkSpeed = v
+            end
+        end
+    end)
+
+    Tabs.Settings:AddSection("Auto Dismantle Gear (ย่อยอุปกรณ์ขยะ)")
+
+    Tabs.Settings:AddToggle("AutoDismantleToggle", {
+        Title = "Auto Dismantle Gear",
+        Description = "ย่อยอุปกรณ์ขยะที่ไม่ได้ใช้และไม่ล็อกอัตโนมัติเพื่อประหยัดช่องกระเป๋า",
+        Default = State.AutoDismantle
+    }):OnChanged(function(v)
+        State.AutoDismantle = v
+        SaveBossHopState(State.AutoBossHop)
+    end)
+
+    Tabs.Settings:AddDropdown("DismantleTierDropdown", {
+        Title = "Dismantle Gear Tier",
+        Description = "เลือกระดับ Tier สูงสุดที่จะย่อย (ของที่สวมใส่ ล็อก และสเตตัสดีกว่าจะได้รับการคุ้มครอง)",
+        Values = {"Tier I - IV", "Tier I - V", "Tier I - III", "Tier I - II"},
+        Default = State.DismantleTier or "Tier I - IV"
+    }):OnChanged(function(v)
+        State.DismantleTier = v
+        SaveBossHopState(State.AutoBossHop)
+    end)
+
+    Tabs.Settings:AddToggle("KeepSuperiorToggle", {
+        Title = "Keep Superior Upgrade Gear",
+        Description = "ป้องกันการย่อยของที่มีสเตตัสสูงกว่าของที่สวมใส่อยู่อัตโนมัติ",
+        Default = (State.KeepSuperiorGear ~= false)
+    }):OnChanged(function(v)
+        State.KeepSuperiorGear = v
+        SaveBossHopState(State.AutoBossHop)
+    end)
+
+    Tabs.Settings:AddToggle("AutoCloseSalvagePopupToggle", {
+        Title = "Auto Close Dismantle Popup",
+        Description = "กดปิดหน้าต่างแจ้งเตือน 'ย่อยสำเร็จ' ให้อัตโนมัติเพื่อไม่ให้บังหน้าจอ",
+        Default = (State.AutoCloseSalvagePopup ~= false)
+    }):OnChanged(function(v)
+        State.AutoCloseSalvagePopup = v
+        SaveBossHopState(State.AutoBossHop)
+        if v then
+            DismissSalvagePopup()
+        end
+    end)
+
+    Tabs.Settings:AddButton({
+        Title = "Dismantle Gear Now (กดย่อยอุปกรณ์ในกระเป๋าทันที)",
+        Description = "สแกนและกดย่อยอุปกรณ์ขยะทั้งหมดในกระเป๋าทันทีในคลิกเดียว",
+        Callback = function()
+            DismantleGearNow(false)
+        end
+    })
+end
+
+
+-- ==================== MOBILE DRAGGABLE FLOATING TOGGLE BUTTON ==================== --
+task.defer(function()
+    pcall(function()
+        local safeGui = GetSafeGuiParent()
+        local sg = Instance.new("ScreenGui")
+        sg.Name = "StreetHub_BossHop_FloatingToggle"
+        sg.ResetOnSpawn = false
+        sg.DisplayOrder = 99999
+        sg.Parent = safeGui
+
+        local vp = Camera and Camera.ViewportSize or Vector2.new(1920, 1080)
+        local initY = math.clamp(math.floor(vp.Y * 0.5), 38, math.max(38, vp.Y - 38))
+
+        local mainBtn = Instance.new("ImageButton")
+        mainBtn.Name = "ToggleButton"
+        mainBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+        mainBtn.Size = UDim2.fromOffset(50, 50)
+        mainBtn.Position = UDim2.new(0, 38, 0, initY)
+        mainBtn.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
+        mainBtn.AutoButtonColor = false
+        mainBtn.BorderSizePixel = 0
+        mainBtn.Parent = sg
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 14)
+        corner.Parent = mainBtn
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Color3.fromRGB(235, 38, 52) -- Street Hub Fiery Red
+        stroke.Thickness = 2
+        stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        stroke.Parent = mainBtn
+
+        -- Subtle breathing glow animation
+        local breathTween = TweenService:Create(stroke, TweenInfo.new(1.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+            Transparency = 0.35
+        })
+        breathTween:Play()
+
+        -- Street Hub Custom Logo Icon
+        local logoImg = Instance.new("ImageLabel")
+        logoImg.Name = "StreetHubLogo"
+        logoImg.Size = UDim2.new(1, -6, 1, -6)
+        logoImg.Position = UDim2.new(0.5, 0, 0.5, 0)
+        logoImg.AnchorPoint = Vector2.new(0.5, 0.5)
+        logoImg.BackgroundTransparency = 1
+        logoImg.ScaleType = Enum.ScaleType.Fit
+        logoImg.ZIndex = 10
+        logoImg.Image = GetStreetHubLogo()
+        logoImg.Parent = mainBtn
+
+        local imgCorner = Instance.new("UICorner")
+        imgCorner.CornerRadius = UDim.new(0, 12)
+        imgCorner.Parent = logoImg
+
+        -- Fallback text if image asset isn't loaded
+        if not (logoImg.Image and logoImg.Image ~= "" and logoImg.Image ~= "rbxassetid://10734975486") then
+            local fallback = Instance.new("TextLabel")
+            fallback.Name = "FallbackText"
+            fallback.Size = UDim2.fromScale(1, 1)
+            fallback.BackgroundTransparency = 1
+            fallback.Text = "👑\nSTREET"
+            fallback.TextColor3 = Color3.fromRGB(235, 38, 52)
+            fallback.Font = Enum.Font.GothamBold
+            fallback.TextSize = 10
+            fallback.ZIndex = 9
+            fallback.Parent = mainBtn
+        end
+
+        -- Smooth dragging logic
+        local dragging = false
+        local dragStart, startPos
+        mainBtn.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                dragStart = input.Position
+                startPos = mainBtn.Position
+                input.Changed:Connect(function()
+                    if input.UserInputState == Enum.UserInputState.End then
+                        dragging = false
+                    end
+                end)
+            end
+        end)
+        UserInputService.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                local delta = input.Position - dragStart
+                mainBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            end
+        end)
+
+        mainBtn.MouseButton1Click:Connect(function()
+            -- Punchy Click Animation Pop
+            pcall(function()
+                local popDown = TweenService:Create(mainBtn, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                    Size = UDim2.fromOffset(42, 42)
+                })
+                popDown:Play()
+                popDown.Completed:Connect(function()
+                    TweenService:Create(mainBtn, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                        Size = UDim2.fromOffset(50, 50)
+                    }):Play()
+                end)
+            end)
+            ToggleStreetHubWindow()
+        end)
+    end)
+end)
+
+-- Initial radar scan
+task.defer(function()
+    task.wait(1.0)
+    pcall(function()
+        if BossRadarParagraph then
+            UpdateBossRadar(BossRadarParagraph)
+        end
+    end)
+end)
+
+Window:SelectTab(1)
+
+Fluent:Notify({
+    Title = "Street Hub",
+    SubTitle = "Boss Server Hop & Radar",
+    Content = "Loaded successfully! Ground combat active.",
+    Duration = 4
+})
